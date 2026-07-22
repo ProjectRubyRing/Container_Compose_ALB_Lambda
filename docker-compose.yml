@@ -1,0 +1,167 @@
+# =============================================================================
+# ALB + Lambda メンテナンス応答 検証環境
+#
+#   [client] --> alb-intraweb (:8081) --> ecs intraweb   / メンテ中: Lambda -> HTML
+#            --> alb-interapi (:8082) --> ecs interapi   / メンテ中: Lambda -> 503 JSON
+#            --> alb-intraapi (:8083) --> ecs intraapi   / メンテ中: Lambda -> 503 JSON
+#            --> alb-sfapi    (:8084) --> ecs sfapi      / メンテ中: Lambda -> 503 JSON
+#
+#   管理 API: 9081 / 9082 / 9083 / 9084 (メンテナンスモード ON/OFF)
+# =============================================================================
+
+name: alb-lambda-maintenance-lab
+
+x-alb: &alb-common
+  build:
+    context: ./alb
+  restart: unless-stopped
+  volumes:
+    - ./alb/config:/etc/alb:ro
+    - alb-state:/state
+  environment:
+    LISTENER_PORT: "80"
+    ADMIN_PORT: "9000"
+    STATE_DIR: /state
+    MAINTENANCE_DEFAULT: "false"
+  depends_on:
+    - maintenance-lambda
+  networks:
+    - lab
+
+x-backend: &backend-common
+  build:
+    context: ./backend
+  restart: unless-stopped
+  networks:
+    - lab
+
+services:
+  # ---------------------------------------------------------------------------
+  # メンテナンス応答 Lambda (4 つの ALB で共有する 1 関数)
+  # ---------------------------------------------------------------------------
+  maintenance-lambda:
+    build:
+      context: ./lambda
+    container_name: maintenance-lambda
+    restart: unless-stopped
+    environment:
+      WEB_SERVICES: "intraweb"
+      API_SERVICES: "interapi,intraapi,sfapi"
+      MAINT_WEB_STATUS: "503"
+      MAINT_API_STATUS: "503"
+      # サービス個別にステータスを変えたい場合の例:
+      # API_STATUS_OVERRIDES: '{"sfapi":503,"interapi":503}'
+      API_STATUS_OVERRIDES: "{}"
+      RETRY_AFTER: "300"
+      MAINT_WINDOW: "2026-08-01 02:00 - 05:00 (JST)"
+      CONTACT: "システム運用窓口 (内線 1234)"
+    ports:
+      # 直接 invoke して Lambda 単体テストしたい場合に使用
+      - "9001:8080"
+    networks:
+      - lab
+
+  # ---------------------------------------------------------------------------
+  # ECS サービス (モック)
+  # ---------------------------------------------------------------------------
+  intraweb:
+    <<: *backend-common
+    container_name: ecs-intraweb
+    environment:
+      SERVICE_NAME: intraweb
+      SERVICE_KIND: web
+
+  interapi:
+    <<: *backend-common
+    container_name: ecs-interapi
+    environment:
+      SERVICE_NAME: interapi
+      SERVICE_KIND: api
+
+  intraapi:
+    <<: *backend-common
+    container_name: ecs-intraapi
+    environment:
+      SERVICE_NAME: intraapi
+      SERVICE_KIND: api
+
+  sfapi:
+    <<: *backend-common
+    container_name: ecs-sfapi
+    environment:
+      SERVICE_NAME: sfapi
+      SERVICE_KIND: api
+
+  # ---------------------------------------------------------------------------
+  # ALB (ECS サービスごとに 1 台)
+  # ---------------------------------------------------------------------------
+  alb-intraweb:
+    <<: *alb-common
+    container_name: alb-intraweb
+    environment:
+      LISTENER_PORT: "80"
+      ADMIN_PORT: "9000"
+      STATE_DIR: /state
+      MAINTENANCE_DEFAULT: "false"
+      ALB_CONFIG: /etc/alb/intraweb.yaml
+    ports:
+      - "8081:80"
+      - "9081:9000"
+    depends_on:
+      - maintenance-lambda
+      - intraweb
+
+  alb-interapi:
+    <<: *alb-common
+    container_name: alb-interapi
+    environment:
+      LISTENER_PORT: "80"
+      ADMIN_PORT: "9000"
+      STATE_DIR: /state
+      MAINTENANCE_DEFAULT: "false"
+      ALB_CONFIG: /etc/alb/interapi.yaml
+    ports:
+      - "8082:80"
+      - "9082:9000"
+    depends_on:
+      - maintenance-lambda
+      - interapi
+
+  alb-intraapi:
+    <<: *alb-common
+    container_name: alb-intraapi
+    environment:
+      LISTENER_PORT: "80"
+      ADMIN_PORT: "9000"
+      STATE_DIR: /state
+      MAINTENANCE_DEFAULT: "false"
+      ALB_CONFIG: /etc/alb/intraapi.yaml
+    ports:
+      - "8083:80"
+      - "9083:9000"
+    depends_on:
+      - maintenance-lambda
+      - intraapi
+
+  alb-sfapi:
+    <<: *alb-common
+    container_name: alb-sfapi
+    environment:
+      LISTENER_PORT: "80"
+      ADMIN_PORT: "9000"
+      STATE_DIR: /state
+      MAINTENANCE_DEFAULT: "false"
+      ALB_CONFIG: /etc/alb/sfapi.yaml
+    ports:
+      - "8084:80"
+      - "9084:9000"
+    depends_on:
+      - maintenance-lambda
+      - sfapi
+
+volumes:
+  alb-state:
+
+networks:
+  lab:
+    driver: bridge

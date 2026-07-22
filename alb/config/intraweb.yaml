@@ -1,0 +1,60 @@
+# =====================================================================
+# ALB: alb-intraweb  (社内向け Web / バックエンド = ECS service intraweb)
+# メンテナンス中は Lambda がメンテナンス画面(HTML)を返す
+# =====================================================================
+alb:
+  name: alb-intraweb
+  service: intraweb
+  kind: web
+
+listener:
+  port: 80
+  # 通常時のデフォルトアクション = ECS へフォワード
+  default_action:
+    type: forward
+    target_group: tg-intraweb-ecs
+
+target_groups:
+  tg-intraweb-ecs:
+    type: ecs
+    endpoint: http://intraweb:8080
+
+  tg-intraweb-maintenance:
+    type: lambda
+    # Lambda はこの targetGroupArn を見て「web 向け」と判断する
+    target_group_arn: arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:targetgroup/tg-intraweb-maintenance/1111111111111111
+    endpoint: http://maintenance-lambda:8080/2015-03-31/functions/function/invocations
+
+rules:
+  # ---- 常時有効なルール ----
+  - name: healthcheck-passthrough
+    priority: 1
+    conditions:
+      - field: path-pattern
+        values: ["/healthz", "/healthz/*"]
+    action:
+      type: forward
+      target_group: tg-intraweb-ecs
+
+  # ---- メンテナンス中のみ差し込まれるルール (maintenance: true) ----
+  # 運用者の社内セグメントからのアクセスはメンテ中でも ECS に通す
+  - name: maintenance-bypass-source-ip
+    priority: 10
+    maintenance: true
+    conditions:
+      - field: source-ip
+        values: ["10.0.100.0/24"]
+    action:
+      type: forward
+      target_group: tg-intraweb-ecs
+
+  # 全リクエストを Lambda(メンテナンス応答)へ
+  - name: maintenance-catch-all
+    priority: 100
+    maintenance: true
+    conditions:
+      - field: path-pattern
+        values: ["/*"]
+    action:
+      type: forward
+      target_group: tg-intraweb-maintenance

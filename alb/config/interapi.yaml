@@ -1,0 +1,56 @@
+# =====================================================================
+# ALB: alb-interapi  (外部連携 API / バックエンド = ECS service interapi)
+# メンテナンス中は Lambda が HTTP ステータスコード(503) + JSON を返す
+# =====================================================================
+alb:
+  name: alb-interapi
+  service: interapi
+  kind: api
+
+listener:
+  port: 80
+  default_action:
+    type: forward
+    target_group: tg-interapi-ecs
+
+target_groups:
+  tg-interapi-ecs:
+    type: ecs
+    endpoint: http://interapi:8080
+
+  tg-interapi-maintenance:
+    type: lambda
+    # Lambda はこの targetGroupArn を見て「api 向け」と判断する
+    target_group_arn: arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:targetgroup/tg-interapi-maintenance/2222222222222222
+    endpoint: http://maintenance-lambda:8080/2015-03-31/functions/function/invocations
+
+rules:
+  - name: healthcheck-passthrough
+    priority: 1
+    conditions:
+      - field: path-pattern
+        values: ["/healthz", "/healthz/*"]
+    action:
+      type: forward
+      target_group: tg-interapi-ecs
+
+  # メンテ中も疎通確認用の ping だけは ECS に通す
+  - name: maintenance-bypass-ping
+    priority: 10
+    maintenance: true
+    conditions:
+      - field: path-pattern
+        values: ["/v1/ping"]
+    action:
+      type: forward
+      target_group: tg-interapi-ecs
+
+  - name: maintenance-catch-all
+    priority: 100
+    maintenance: true
+    conditions:
+      - field: path-pattern
+        values: ["/*"]
+    action:
+      type: forward
+      target_group: tg-interapi-maintenance

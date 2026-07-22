@@ -1,0 +1,60 @@
+# =====================================================================
+# ALB: alb-sfapi  (Salesforce 連携 API / バックエンド = ECS service sfapi)
+# メンテナンス中は Lambda が HTTP ステータスコード(503) + JSON を返す
+# 参考として fixed-response ルール(Lambda を経由しない例)も含む
+# =====================================================================
+alb:
+  name: alb-sfapi
+  service: sfapi
+  kind: api
+
+listener:
+  port: 80
+  default_action:
+    type: forward
+    target_group: tg-sfapi-ecs
+
+target_groups:
+  tg-sfapi-ecs:
+    type: ecs
+    endpoint: http://sfapi:8080
+
+  tg-sfapi-maintenance:
+    type: lambda
+    target_group_arn: arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:targetgroup/tg-sfapi-maintenance/4444444444444444
+    endpoint: http://maintenance-lambda:8080/2015-03-31/functions/function/invocations
+
+rules:
+  - name: healthcheck-passthrough
+    priority: 1
+    conditions:
+      - field: path-pattern
+        values: ["/healthz", "/healthz/*"]
+    action:
+      type: forward
+      target_group: tg-sfapi-ecs
+
+  # ALB 単体(Lambda 無し)でメンテ応答する比較用ルール。
+  # /internal/* だけは ALB の fixed-response で 503 を返す。
+  - name: maintenance-fixed-response-internal
+    priority: 20
+    maintenance: true
+    conditions:
+      - field: path-pattern
+        values: ["/internal/*"]
+    action:
+      type: fixed-response
+      fixed_response_config:
+        status_code: 503
+        content_type: application/json
+        message_body: '{"code":"SERVICE_UNDER_MAINTENANCE","by":"alb-fixed-response"}'
+
+  - name: maintenance-catch-all
+    priority: 100
+    maintenance: true
+    conditions:
+      - field: path-pattern
+        values: ["/*"]
+    action:
+      type: forward
+      target_group: tg-sfapi-maintenance

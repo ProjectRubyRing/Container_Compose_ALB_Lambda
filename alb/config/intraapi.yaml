@@ -1,0 +1,57 @@
+# =====================================================================
+# ALB: alb-intraapi  (社内 API / バックエンド = ECS service intraapi)
+# メンテナンス中は Lambda が HTTP ステータスコード(503) + JSON を返す
+# バイパスはヘッダ(運用トークン)で行う例
+# =====================================================================
+alb:
+  name: alb-intraapi
+  service: intraapi
+  kind: api
+
+listener:
+  port: 80
+  default_action:
+    type: forward
+    target_group: tg-intraapi-ecs
+
+target_groups:
+  tg-intraapi-ecs:
+    type: ecs
+    endpoint: http://intraapi:8080
+
+  tg-intraapi-maintenance:
+    type: lambda
+    target_group_arn: arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:targetgroup/tg-intraapi-maintenance/3333333333333333
+    endpoint: http://maintenance-lambda:8080/2015-03-31/functions/function/invocations
+
+rules:
+  - name: healthcheck-passthrough
+    priority: 1
+    conditions:
+      - field: path-pattern
+        values: ["/healthz", "/healthz/*"]
+    action:
+      type: forward
+      target_group: tg-intraapi-ecs
+
+  # メンテ中でも運用ツールのヘッダを持つリクエストは ECS に通す
+  - name: maintenance-bypass-header
+    priority: 10
+    maintenance: true
+    conditions:
+      - field: http-header
+        http_header_name: X-Maintenance-Bypass
+        values: ["ops-secret-token"]
+    action:
+      type: forward
+      target_group: tg-intraapi-ecs
+
+  - name: maintenance-catch-all
+    priority: 100
+    maintenance: true
+    conditions:
+      - field: path-pattern
+        values: ["/*"]
+    action:
+      type: forward
+      target_group: tg-intraapi-maintenance
