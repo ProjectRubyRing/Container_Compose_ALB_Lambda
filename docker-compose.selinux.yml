@@ -1,0 +1,36 @@
+# =============================================================================
+# SELinux が Enforcing のホスト (RHEL / Rocky / Alma / Amazon Linux 2023 など) 用の
+# 追加設定。バインドマウントに :z を付けてコンテナから読めるようにラベルを付け替える。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.selinux.yml up -d --build
+#   podman compose -f docker-compose.yml -f docker-compose.selinux.yml up -d --build
+#
+# :z を付けないと ALB コンテナが /etc/alb/*.yaml を読めずに起動に失敗し、
+# ホストからは「connection refused」に見えます (待ち受けているプロセスが無いため)。
+#
+# SELinux の状態は次で確認できます:
+#   getenforce                      … Enforcing なら このファイルが必要
+#   ./scripts/report.sh doctor      … 判定と対処コマンドをまとめて表示
+# =============================================================================
+
+services:
+  alb-intraweb:
+    volumes:
+      - ./alb/config:/etc/alb:ro,z
+
+  alb-interapi:
+    volumes:
+      - ./alb/config:/etc/alb:ro,z
+
+  alb-intraapi:
+    volumes:
+      - ./alb/config:/etc/alb:ro,z
+
+  alb-sfapi:
+    volumes:
+      - ./alb/config:/etc/alb:ro,z
+
+  inspector:
+    volumes:
+      - ./tools:/work/tools:ro,z
+      - ./reports:/work/reports:z

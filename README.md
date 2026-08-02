@@ -114,10 +114,15 @@ Lambda 直接 invoke 用（RIE）:
 ## 3. 必要なもの
 
 - Docker Desktop（Compose v2 同梱）… 動作確認済み: Docker 26.0.0 / Compose v2.26.1
+  - Linux では **podman / nerdctl でも動きます**（`report.sh` が自動で選びます）。
+    RHEL 9 なら `sudo dnf install -y podman podman-compose`
 - 初回ビルド時のみインターネット接続（`python:3.12-slim` と `public.ecr.aws/lambda/python:3.12` を取得）
 - 検証コマンド用に、次のいずれか
   - Windows PowerShell（同梱の `.ps1` スクリプト）
   - bash + curl（Git Bash / WSL / macOS / Linux。同梱の `.sh` スクリプト）
+- **ブラウザは不要です。** メンテナンス画面はターミナルへテキスト描画します。
+  EC2 へ Session Manager で入っただけの GUI なし環境でも全機能が使えます
+  （→ [9-3 章](#9-3-ブラウザが使えない環境での確認ec2--session-manager-など)）
 
 - （任意）Python 3.8 以上 … `scripts/report.ps1` / `report.sh` をホストで直接動かす場合。
   **入っていなくても構いません**（自動で `inspector` コンテナにフォールバックします）。
@@ -161,6 +166,7 @@ bash scripts/verify.sh          # PASS=44 / FAIL=0 になれば成功
 | 検証結果を Excel で残したい | `.\scripts\report.ps1 report` | [10 章](#10-excel-レポートを出力する) |
 | 自作の Lambda で検証したい | `lambda-custom\app.py` を編集 → `.\scripts\mctl.ps1 lambda custom` | [11 章](#11-lambda-を自作のものに差し替えて検証する) |
 | メンテナンスを ON/OFF したい | `.\scripts\mctl.ps1 on intraweb` | [6 章](#6-メンテナンスモードの切り替え方) |
+| 接続エラーになる／ブラウザが使えない | `./scripts/report.sh doctor` | [9-3 章](#9-3-ブラウザが使えない環境での確認ec2--session-manager-など) |
 
 ---
 
@@ -169,6 +175,7 @@ bash scripts/verify.sh          # PASS=44 / FAIL=0 になれば成功
 ```
 Container_Compose_ALB_Lambda/
 ├─ docker-compose.yml            … 全コンテナ定義（ALB4台 + ECS4台 + Lambda2台 + ツール1台）
+├─ docker-compose.selinux.yml    … SELinux が Enforcing のホスト用の追加設定（→ 9-3 章）
 ├─ README.md                     … このファイル
 ├─ alb/                          … ALB シミュレータ
 │  ├─ Dockerfile
@@ -191,7 +198,8 @@ Container_Compose_ALB_Lambda/
 │  └─ app.py
 ├─ tools/                        … 検証ツール（pip install 不要・標準ライブラリのみ）
 │  ├─ Dockerfile                 … inspector コンテナ（w3m / lynx 同梱）
-│  ├─ albcheck.py                … CLI 本体（check / report / contract / variant / render）
+│  ├─ albcheck.py                … CLI 本体（check / report / contract / variant / render / doctor）
+│  ├─ envprobe.py                … 接続先の自動検出と環境診断（GUI 不要・→ 9-3 章）
 │  ├─ textrender.py              … HTML・JSON をテキストブラウザ風に描画（全角幅対応）
 │  ├─ report_excel.py            … 検証結果と画面表示を Excel シートへ
 │  └─ xlsxlite.py                … 依存なしの最小 xlsx ライタ
@@ -530,6 +538,7 @@ bash 環境の場合:
 | `contract` | 自作 Lambda が ALB 統合の契約を守っているか検証（→ 11 章） |
 | `variant [builtin\|custom]` | invoke 先 Lambda の確認・切り替え（→ 11 章） |
 | `render <url\|file\|service>` | 画面のテキスト描画だけを見る |
+| `doctor` | **繋がらないときの原因切り分け**（→ [9-3 章](#9-3-ブラウザが使えない環境での確認ec2--session-manager-など)） |
 
 ### 9-2. よく使うオプション
 
@@ -542,6 +551,18 @@ bash 環境の場合:
 | `--xff 10.0.100.5` | `X-Forwarded-For` を指定（`source-ip` 条件の検証用） |
 | `--raw` | 本文の生データも表示 |
 | `--no-color` | ANSI 色を使わない（ログに残すとき） |
+| `--save screen.html` | `check` のレスポンス本文をファイルに保存（後で手元へ持ち帰って開ける） |
+| `--save-text screen.txt` | `check` の画面描画結果をテキストで保存（そのまま報告書に貼れる） |
+| `--no-autodiscover` | 接続先の自動検出をやめ、`localhost` だけを使う |
+
+ラッパ（`report.sh` / `report.ps1`）には、**実行場所**を選ぶオプションもあります。
+サブコマンドより**前**に置いてください。
+
+| オプション | 説明 |
+|---|---|
+| （無指定） | ホストから届くか確認し、届かなければコンテナ内実行へ自動で切り替え |
+| `--host` | 必ずホストの Python で実行する |
+| `--in-container` | 必ず検証用コンテナの中から実行する（ホストのポートに届かない環境向け） |
 
 ```powershell
 # 運用者セグメントからのアクセスを再現（バイパスされて ECS の画面が出る）
@@ -559,6 +580,85 @@ bash 環境の場合:
 > フォールバックします。この `inspector` コンテナには **w3m / lynx が入っている**ので、
 > `--renderer w3m` での確認もそのまま行えます。
 > 直接呼ぶ場合: `docker compose run --rm inspector check intraweb /dashboard`
+
+### 9-3. ブラウザが使えない環境での確認（EC2 + Session Manager など）
+
+**このツールはブラウザを一切使いません。** `check` / `render` の画面表示は、HTML を自前で
+解析してターミナルへ描画しているだけなので、GUI も X サーバも DISPLAY も不要です。
+EC2（RHEL / Amazon Linux）へ Session Manager で入った CLI だけの環境でも、
+ブラウザで見るのと同じ内容を確認できます。
+
+```bash
+./scripts/mctl.sh on intraweb                    # メンテナンスモードにする
+./scripts/report.sh check intraweb /dashboard    # メンテ画面をテキストで描画
+./scripts/report.sh report                       # 全シナリオ検証 + Excel レポート
+```
+
+画面を手元へ持ち帰りたい場合は保存できます（`scp` / `sftp` / S3 経由で回収してください）。
+
+```bash
+./scripts/report.sh check intraweb /dashboard \
+    --save reports/screen.html \
+    --save-text reports/screen.txt
+```
+
+#### 接続エラー `<urlopen error [Errno 111] Connection refused>` が出るとき
+
+これは**ブラウザの有無とは無関係**で、`127.0.0.1:8081` で待ち受けているプロセスが無い、
+という意味です。原因を切り分けるコマンドを用意しています。
+
+```bash
+./scripts/report.sh doctor
+```
+
+`doctor` は次をまとめて表示し、終了コードで結果を返します（到達可 = 0 / 到達不可 = 3）。
+
+| 表示するもの | 分かること |
+|---|---|
+| 実行環境 | OS・Python・コンテナ内かどうか・SELinux の状態・GUI ブラウザの有無 |
+| コンテナランタイム | `docker` / `podman` / `nerdctl` の有無と、使えない場合はその理由 |
+| コンテナの状態 | 10 コンテナの起動状況。**落ちているものはログ末尾も表示** |
+| 接続確認 | ALB 4 本 + 管理 API 4 本 + Lambda 2 本へ実際にリクエストし、失敗理由を日本語で表示 |
+| 診断 | 原因の判定と、そのまま貼れる対処コマンド |
+| export 行 | 他のスクリプト（`mctl.sh` / `verify.sh`）に同じ接続先を使わせるための `export` |
+
+よくある原因と対処:
+
+| 原因 | 対処 |
+|---|---|
+| そもそもコンテナが起動していない | `docker compose up -d --build`（`doctor` の「コンテナの状態」で分かります） |
+| RHEL に docker が無い（podman だけ） | `podman compose up -d --build`。`report.sh` は `podman` / `nerdctl` も自動で使います |
+| **SELinux が Enforcing** で ALB がマウントを読めず落ちている | `docker compose -f docker-compose.yml -f docker-compose.selinux.yml up -d --build`（`:z` 付きでマウントし直します） |
+| ポートが公開されていない / rootless で届かない | `./scripts/report.sh --in-container check intraweb /dashboard` |
+
+#### 接続先の自動検出
+
+`albcheck` は接続先を次の順に試し、**最初に繋がったところを自動で採用**します。
+どこを使ったかは `[接続先を自動検出] ...` の行に出ます。
+
+1. 環境変数 `ALB_URL_<SERVICE>` / `ADMIN_URL_<SERVICE>` / `LAMBDA_URL_<VARIANT>`（明示指定が最優先）
+2. ホストへ公開されたポート … `http://127.0.0.1:8081`
+3. コンテナ名 … `http://alb-intraweb`（コンテナの中から実行したとき）
+4. コンテナ IP … `http://172.x.x.x:80`（Linux + rootful ランタイム）
+
+そのため、ホストから届かない環境でも `--in-container` を付ければそのまま動きます。
+`mctl.sh` / `verify.sh` は環境変数のみを見るので、`doctor` が出力する `export` 行を
+実行してから使ってください。
+
+```bash
+eval "$(./scripts/report.sh doctor | grep '^  export ' | sed 's/^  //')"
+./scripts/verify.sh
+```
+
+> **どうしてもブラウザで見たい場合**（GUI のある手元 PC から）
+> Session Manager のポートフォワードで EC2 の 8081 を手元へ転送できます。
+> ```bash
+> aws ssm start-session --target <instance-id> \
+>     --document-name AWS-StartPortForwardingSession \
+>     --parameters '{"portNumber":["8081"],"localPortNumber":["8081"]}'
+> ```
+> 転送後、手元のブラウザで `http://localhost:8081/dashboard` を開きます。
+> ただし上記のテキスト描画で同じ内容が確認できるため、通常は不要です。
 
 ---
 
@@ -1035,6 +1135,11 @@ AWS 側で必要な追加設定（ローカルでは省略しているもの）:
 
 | 症状 | 原因と対処 |
 |---|---|
+| **`<urlopen error [Errno 111] Connection refused>` が返る** | そのポートで待ち受けているプロセスがありません（ブラウザの有無とは無関係）。`./scripts/report.sh doctor` が原因と対処コマンドを出します（→ [9-3 章](#9-3-ブラウザが使えない環境での確認ec2--session-manager-など)） |
+| RHEL / Amazon Linux で `docker: command not found` | podman が入っていることが多いです。`podman compose up -d --build`。`report.sh` は `podman` / `nerdctl` も自動検出します |
+| RHEL で ALB コンテナがすぐ落ちる（→ 接続拒否） | SELinux が Enforcing でバインドマウントを読めていない可能性。`docker compose -f docker-compose.yml -f docker-compose.selinux.yml up -d --build` |
+| コンテナは Up なのにホストから届かない | rootless 実行やポート未公開。`./scripts/report.sh --in-container check intraweb /dashboard` でコンテナの中から確認 |
+| ブラウザが開けないので画面を確認できない | 確認できます。`./scripts/report.sh check intraweb /dashboard` がメンテ画面をテキスト描画します。ファイルに残すなら `--save` / `--save-text` |
 | `docker compose up` でポート競合エラー | 8081-8084 / 9001 / 9081-9084 が使用中。`docker-compose.yml` の `ports` を変更 |
 | `.ps1` が「Unexpected token」で落ちる | 実行ポリシー or 文字コード。`powershell -ExecutionPolicy Bypass -File .\scripts\verify.ps1` で実行してください（同梱スクリプトは UTF-8 BOM 付きで保存済み） |
 | すべて 502 が返る | Lambda コンテナが起動途中。`docker compose logs maintenance-lambda` を確認し数秒待つ |

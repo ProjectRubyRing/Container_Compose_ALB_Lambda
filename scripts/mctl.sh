@@ -33,12 +33,20 @@ admin_port() {
   esac
 }
 
+# 管理 API の URL。localhost に届かない環境 (コンテナ内 / rootless など) では
+# ADMIN_URL_<SERVICE> で上書きできる。値は ./scripts/report.sh doctor が教えてくれる。
+admin_base() {
+  local var="ADMIN_URL_$(echo "$1" | tr '[:lower:]' '[:upper:]')"
+  local override="${!var:-}"
+  if [ -n "$override" ]; then echo "${override%/}"; else echo "http://localhost:$(admin_port "$1")"; fi
+}
+
 targets() {
   if [ "$service" = "all" ]; then echo "intraweb interapi intraapi sfapi"; else echo "$service"; fi
 }
 
 for s in $(targets); do
-  base="http://localhost:$(admin_port "$s")"
+  base="$(admin_base "$s")"
   case "$action" in
     status) curl -s "$base/admin/state" ; echo ;;
     on)     curl -s -X POST "$base/admin/maintenance/on" ; echo ;;

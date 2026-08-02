@@ -7,11 +7,16 @@ albcheck — ALB × Lambda メンテナンス応答の呼び出し確認ツー�
     python tools/albcheck.py contract --variant custom       # 自作 Lambda が契約を守っているか
     python tools/albcheck.py variant  custom                 # invoke 先 Lambda を差し替える
     python tools/albcheck.py render   http://localhost:8081/ # 画面をテキストブラウザ表示
+    python tools/albcheck.py doctor                          # 繋がらないときの原因診断
 
 pip install は不要 (urllib + 自作 xlsx ライタ)。接続先はすべて環境変数で上書きできる:
     ALB_URL_<SERVICE>     例 ALB_URL_INTRAWEB=http://alb-intraweb
     ADMIN_URL_<SERVICE>   例 ADMIN_URL_INTRAWEB=http://alb-intraweb:9000
     LAMBDA_URL_<VARIANT>  例 LAMBDA_URL_CUSTOM=http://custom-lambda:8080/...
+
+環境変数が無い場合は接続先を自動検出する (ホストの公開ポート → コンテナ名 → コンテナ IP)。
+ブラウザを開けない環境 (Session Manager 経由の EC2 など) を想定しているため、GUI は一切不要。
+自動検出を止めたいときは --no-autodiscover か ALBCHECK_AUTODISCOVER=0。
 """
 
 import argparse
@@ -24,7 +29,13 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import envprobe as P  # noqa: E402
 import textrender as T  # noqa: E402
+
+# 終了コード
+EXIT_OK = 0
+EXIT_FAILED = 1          # 検証項目が期待どおりでない
+EXIT_UNREACHABLE = 3     # そもそも検証環境へ接続できない (ラッパがこれを見て再実行する)
 
 # ---------------------------------------------------------------------------
 # 接続先
@@ -49,19 +60,107 @@ TARGET_GROUP_ARNS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 接続先の自動検出
+#
+# ブラウザも GUI も無い環境 (Session Manager 経由の EC2 など) では、
+# 「localhost:8081 が繋がらない = 何も確認できない」になりがちなので、
+# 次の順に候補を試して、繋がったところを自動的に採用する。
+#
+#   1. 環境変数 (ALB_URL_* / ADMIN_URL_* / LAMBDA_URL_*)  … 明示指定が最優先
+#   2. ホストに公開されたポート    127.0.0.1:8081 など     … 通常のホスト実行
+#   3. コンテナ名                  http://alb-intraweb     … inspector コンテナの中から
+#   4. コンテナ IP                 http://172.x.x.x:80     … Linux + rootful ランタイム
+#
+# どれも駄目なら doctor で原因を切り分けられるよう、試行結果を残しておく。
+# ---------------------------------------------------------------------------
+AUTODISCOVER = os.environ.get("ALBCHECK_AUTODISCOVER", "1") != "0"
+_ENDPOINTS = {}      # key -> P.Endpoint (採用したもの)
+_ATTEMPTS = {}       # key -> [P.Endpoint] (全試行結果)
+_ANNOUNCED = set()   # 自動検出の通知を出したキー
+_RUNTIME_CACHE = []
+
+
+def _runtime():
+    """コンテナ IP を引くためのランタイム (見つからなければ None)"""
+    if not _RUNTIME_CACHE:
+        _RUNTIME_CACHE.append(P.primary_runtime())
+    return _RUNTIME_CACHE[0]
+
+
+def _by_container_ip(container, port, path=""):
+    """コンテナ IP から URL を組み立てる (前の候補が全滅したときだけ評価される)"""
+    def thunk():
+        runtime = _runtime()
+        if not runtime:
+            return ""
+        ip = P.container_ip(runtime.name, container)
+        return "http://%s:%d%s" % (ip, port, path) if ip else ""
+    return thunk
+
+
+def _endpoint(key, env_name, specs):
+    """key ごとに接続先を 1 度だけ解決してキャッシュする"""
+    if key in _ENDPOINTS:
+        return _ENDPOINTS[key]
+
+    override = os.environ.get(env_name)
+    if override:
+        endpoint = P.Endpoint(override, "環境変数 %s" % env_name, True, "明示指定")
+    elif not AUTODISCOVER:
+        source, spec = specs[0]
+        endpoint = P.Endpoint(spec() if callable(spec) else spec, source)
+        _ATTEMPTS[key] = [endpoint]
+    else:
+        found, attempts = P.resolve(specs)
+        _ATTEMPTS[key] = attempts
+        # 全滅した場合も既定候補を返しておく (エラー本文が従来どおりになる)
+        endpoint = found or attempts[0]
+        if found is None:
+            # 1 つも繋がらない環境で report を流すと候補探索だけで何十秒もかかるので、
+            # 2 件目以降のタイムアウトは詰める (どうせ同じ結果になる)
+            P.PROBE_TIMEOUT = min(P.PROBE_TIMEOUT, 0.3)
+        if found is not None and attempts[0] is not found and key not in _ANNOUNCED:
+            _ANNOUNCED.add(key)
+            print(c("[接続先を自動検出] %s → %s  (%s / %s は %s)"
+                    % (key, found.url, found.source,
+                       attempts[0].url or "既定候補", attempts[0].detail), "38;5;244"))
+
+    _ATTEMPTS.setdefault(key, [endpoint])
+    _ENDPOINTS[key] = endpoint
+    return endpoint
+
+
 def alb_url(service):
-    return os.environ.get("ALB_URL_" + service.upper(),
-                          "http://localhost:%d" % _ALB_PORTS[service]).rstrip("/")
+    return _endpoint("%s ALB" % service, "ALB_URL_" + service.upper(), [
+        ("ホストの公開ポート", "http://127.0.0.1:%d" % _ALB_PORTS[service]),
+        ("コンテナ名 (lab ネットワーク内)", "http://alb-%s" % service),
+        ("コンテナ IP", _by_container_ip("alb-%s" % service, 80)),
+    ]).url
 
 
 def admin_url(service):
-    return os.environ.get("ADMIN_URL_" + service.upper(),
-                          "http://localhost:%d" % _ADMIN_PORTS[service]).rstrip("/")
+    return _endpoint("%s 管理 API" % service, "ADMIN_URL_" + service.upper(), [
+        ("ホストの公開ポート", "http://127.0.0.1:%d" % _ADMIN_PORTS[service]),
+        ("コンテナ名 (lab ネットワーク内)", "http://alb-%s:9000" % service),
+        ("コンテナ IP", _by_container_ip("alb-%s" % service, 9000)),
+    ]).url
 
 
 def lambda_url(variant):
-    default = "http://localhost:%d%s" % (_LAMBDA_PORTS.get(variant, 9001), RIE_PATH)
-    return os.environ.get("LAMBDA_URL_" + variant.upper(), default)
+    container = P.LAMBDA_CONTAINER.get(variant, "maintenance-lambda")
+    return _endpoint("%s Lambda (RIE)" % variant, "LAMBDA_URL_" + variant.upper(), [
+        ("ホストの公開ポート",
+         "http://127.0.0.1:%d%s" % (_LAMBDA_PORTS.get(variant, 9001), RIE_PATH)),
+        ("コンテナ名 (lab ネットワーク内)", "http://%s:8080%s" % (container, RIE_PATH)),
+        ("コンテナ IP", _by_container_ip(container, 8080, RIE_PATH)),
+    ]).url
+
+
+def unreachable_keys():
+    """接続先を 1 つも解決できなかったものの一覧"""
+    return [key for key, attempts in _ATTEMPTS.items()
+            if attempts and not any(a.ok for a in attempts)]
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +289,9 @@ def evaluate(resp, expects, variant=None):
         checks.append(Check(label, expected, actual, ok, level))
 
     if resp.error:
-        add("接続", "接続できること", "エラー: %s" % resp.error, False)
+        detail = P.explain_error_text(resp.error)
+        add("接続", "接続できること",
+            "エラー: %s%s" % (resp.error, ("  / %s" % detail) if detail else ""), False)
         return checks
 
     if "status" in expects:
@@ -461,6 +562,7 @@ def print_detail(result, width=78, show_screen=True, show_body=False):
     if resp.error:
         print()
         print("  " + c("接続エラー: %s" % resp.error, "1;31"))
+        print_connection_help(resp.url, resp.error, width)
         return
 
     section("レスポンス", width)
@@ -511,6 +613,78 @@ def print_detail(result, width=78, show_screen=True, show_body=False):
     if show_body:
         section("レスポンス本文 (生データ)", width)
         print(resp.body)
+    print()
+
+
+def print_connection_help(url, error, width=78):
+    """接続できなかったときに、その場で次の一手が分かる短い診断を出す
+
+    ブラウザで開いて確かめる、という選択肢が無い環境向けなので、
+    「何を試して」「なぜ駄目で」「次に何をすればよいか」まで文字で出し切る。
+    """
+    detail = P.explain_error_text(error)
+    if detail:
+        print("  " + c("→ " + detail, "33"))
+
+    section("試した接続先", width)
+    tried = False
+    for key, attempts in _ATTEMPTS.items():
+        if any(a.ok for a in attempts):
+            continue
+        tried = True
+        print("  %s" % c(key, "1"))
+        for attempt in attempts:
+            print("    %s %s %s" % (c("✘", "31"),
+                                    T.pad_to_width(attempt.url or
+                                                   "[%s]" % attempt.source, 44),
+                                    attempt.detail))
+    if not tried:
+        print("  (自動検出は無効です。--no-autodiscover / ALBCHECK_AUTODISCOVER=0 を確認)")
+
+    section("コンテナの状態", width)
+    runtime = _runtime()
+    if runtime is None:
+        installed = P.runtimes()
+        if not installed:
+            print("  " + c("コンテナランタイム (docker / podman / nerdctl) が"
+                           "見つかりません", "1;31"))
+            print("    RHEL では: sudo dnf install -y podman podman-compose")
+        else:
+            print("  " + c("ランタイムはありますが使える状態ではありません", "1;31"))
+            for entry in installed:
+                print("    %s: %s" % (entry.name,
+                                      T.trim_to_width(entry.reason, width - 10)))
+    else:
+        table, _ = P.containers(runtime.name)
+        down = []
+        for name in P.ALL_CONTAINERS:
+            row = table.get(name)
+            if row is None:
+                down.append((name, "存在しません"))
+            elif row["state"].lower() != "running":
+                down.append((name, row["status"] or row["state"]))
+        if not down:
+            print("  " + c("10 コンテナすべて running です", "32")
+                  + " — ポート公開設定 (ports:) と firewalld を確認してください")
+        else:
+            print("  " + c("起動していないコンテナ: %d 件" % len(down), "1;31"))
+            for name, why in down[:6]:
+                print("    %s %-22s %s" % (c("✘", "31"), name, why))
+            if len(down) > 6:
+                print("    ... ほか %d 件" % (len(down) - 6))
+            first = down[0][0]
+            logs = P.container_logs(runtime.name, first, 5)
+            if logs:
+                print("  %s のログ末尾:" % c(first, "1"))
+                for line in logs:
+                    print("    | " + T.trim_to_width(line, width - 6))
+
+    section("次にやること", width)
+    compose = runtime.compose_display if (runtime and runtime.compose) else "docker compose"
+    print("  1. 詳しい診断と対処コマンド : %s" % c("./scripts/report.sh doctor", "1;36"))
+    print("  2. 起動していなければ       : %s up -d --build" % compose)
+    print("  3. コンテナの中から確認     : %s"
+          % c("./scripts/report.sh --in-container check intraweb /dashboard", "1;36"))
     print()
 
 
@@ -647,12 +821,33 @@ def cmd_check(args):
     result = do_case(case, "手動確認", args.width, args.renderer)
     print_detail(result, args.width, show_screen=not args.no_screen, show_body=args.raw)
 
+    if args.save and not result.resp.error:
+        _save_text(args.save, result.resp.body)
+    if args.save_text and not result.resp.error:
+        _save_text(args.save_text, "\n".join(
+            text for _style, text in T.frame(
+                result.screen_lines, args.width,
+                title=result.screen_title or result.resp.content_type.split(";")[0],
+                subtitle="%s %s  →  %s" % (case.method, result.resp.url,
+                                           result.resp.status))) + "\n")
+
     if args.excel:
         run = Run(_current_variant(service), args.width, args.renderer)
         run.results = [result]
         run.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
         _write_excel(run, args.excel)
-    return 0 if not result.resp.error else 1
+    return EXIT_OK if not result.resp.error else EXIT_UNREACHABLE
+
+
+def _save_text(path, text):
+    """本文 / 画面描画をファイルに残す (scp や sftp で持ち出して見るため)"""
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    print(c("保存しました: %s (%d bytes)"
+            % (os.path.abspath(path), len(text.encode("utf-8"))), "1;32"))
 
 
 def _current_variant(service):
@@ -660,7 +855,24 @@ def _current_variant(service):
     return info.get("variant", "?")
 
 
+def _abort_if_unreachable(args):
+    """どの ALB にも届かないなら、65 ケースを空振りさせずに診断を出して止める"""
+    if not AUTODISCOVER:
+        return None
+    urls = [alb_url(service) for service in SERVICES]
+    if any(any(a.ok for a in _ATTEMPTS.get("%s ALB" % s, [])) for s in SERVICES):
+        return None
+    print()
+    print(c("どの ALB にも接続できないため検証を中止しました。", "1;31"))
+    print_connection_help(urls[0], "connection refused", args.width)
+    return EXIT_UNREACHABLE
+
+
 def cmd_report(args):
+    aborted = _abort_if_unreachable(args)
+    if aborted is not None:
+        return aborted
+
     variants = []
     if args.variant == "both":
         variants = ["builtin", "custom"]
@@ -689,6 +901,14 @@ def cmd_report(args):
 
     for run in runs:
         _print_summary(run, args.width)
+
+    # 1 件も応答が無い = 検証環境に届いていない。ラッパが別経路で再実行できるよう区別する
+    all_results = [r for run in runs for r in run.results]
+    if all_results and all(r.resp.error for r in all_results):
+        print()
+        print(c("検証環境へ 1 件も到達できませんでした。", "1;31"))
+        print_connection_help(all_results[0].resp.url, all_results[0].resp.error, args.width)
+        return EXIT_UNREACHABLE
 
     if not args.no_excel:
         path = args.excel or _default_excel_path()
@@ -795,6 +1015,10 @@ def cmd_contract(args):
     print(c("契約チェック: %s" % ("NG %d 件" % failed if failed else "すべて適合"),
             "1;31" if failed else "1;32"))
 
+    if all(resp.error for _s, _e, _c, resp, _p in results):
+        print_connection_help(endpoint, results[0][3].error, args.width)
+        return EXIT_UNREACHABLE
+
     if args.excel:
         run = Run(args.variant, args.width, args.renderer)
         run.contract = results
@@ -839,7 +1063,8 @@ def cmd_render(args):
             h.split(":", 1) for h in args.header) if args.header else {})
         if resp.error:
             print(c("接続エラー: %s" % resp.error, "1;31"))
-            return 1
+            print_connection_help(target, resp.error, args.width)
+            return EXIT_UNREACHABLE
         ctype, body, status = resp.content_type, resp.body, resp.status
     else:
         with open(target, "r", encoding="utf-8") as f:
@@ -849,6 +1074,192 @@ def cmd_render(args):
     print(T.to_ansi(T.frame(lines, args.width, title=title or ctype,
                             subtitle="%s  →  %s" % (target, status)), COLOR))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# doctor — ブラウザを開けない環境での原因切り分け
+# ---------------------------------------------------------------------------
+def _probe_targets():
+    """(_ATTEMPTS のキー, 疎通確認する URL, メソッド) の一覧"""
+    rows = []
+    for service in SERVICES:
+        rows.append(("%s ALB" % service, alb_url(service) + "/", "GET"))
+        rows.append(("%s 管理 API" % service, admin_url(service) + "/admin/state", "GET"))
+    for variant in ("builtin", "custom"):
+        rows.append(("%s Lambda (RIE)" % variant, lambda_url(variant), "POST"))
+    return rows
+
+
+def _probe(url, method):
+    if method == "POST":
+        return http(url, "POST", {"Content-Type": "application/json"},
+                    json.dumps(elb_event("intraweb")), timeout=8)
+    return http(url, timeout=8)
+
+
+def _quiet_doctor():
+    """ラッパ用の高速プリフライト: intraweb に届くかだけを短いタイムアウトで見る"""
+    P.PROBE_TIMEOUT = float(os.environ.get("ALBCHECK_PROBE_TIMEOUT", "0.5"))
+    url = alb_url("intraweb")
+    resp = http(url + "/", timeout=5)
+    if not resp.error:
+        source = _ENDPOINTS["intraweb ALB"].source
+        print("albcheck: 検証環境へ到達できます (%s / %s)" % (url, source), file=sys.stderr)
+        return EXIT_OK
+    print("albcheck: 検証環境へ到達できません (%s : %s)"
+          % (url, P.explain_error_text(resp.error) or resp.error), file=sys.stderr)
+    return EXIT_UNREACHABLE
+
+
+def _label(text, width):
+    return T.pad_to_width(text, width)
+
+
+def cmd_doctor(args):
+    width = args.width
+    if args.quiet:
+        return _quiet_doctor()
+
+    # 先に全部解決しておく (自動検出の通知がセクションの途中に割り込まないように)
+    rows = _probe_targets()
+
+    info = P.host_report()
+    print()
+    print(c("═" * width, "38;5;39"))
+    print(" " + c("albcheck doctor — 接続できないときの原因切り分け (GUI 不要)", "1"))
+    print(c("═" * width, "38;5;39"))
+
+    section("実行環境", width)
+    print("  %s %s" % (_label("OS", 14), info["os"]))
+    print("  %s %s" % (_label("Python", 14), info["python"]))
+    print("  %s %s" % (_label("実行場所", 14), info["where"]))
+    print("  %s %s" % (_label("SELinux", 14), info["selinux"] or "無効 / 非対応"))
+    if info["ssm"]:
+        print("  %s %s" % (_label("接続経路", 14),
+                           "AWS Systems Manager セッション (GUI なし)"))
+    print("  %s %s" % (_label("GUI ブラウザ", 14),
+                       "あり (%s)" % info["gui_reason"] if info["gui_browser"]
+                       else c("なし", "1;33") + " — %s" % info["gui_reason"]))
+    print("  %s %s" % (_label("テキスト描画", 14), "builtin (内蔵)" + (
+        " / " + ", ".join(info["text_browsers"]) if info["text_browsers"]
+        else "   ※ w3m / lynx は未インストール (内蔵描画で確認できます)")))
+    if not info["gui_browser"]:
+        print("  " + c("→ ブラウザの代わりに check / render のテキスト描画で"
+                       "メンテナンス画面を確認できます", "32"))
+
+    section("コンテナランタイム", width)
+    runtime_list = P.runtimes()
+    if not runtime_list:
+        print("  " + c("✘ docker / podman / nerdctl のいずれも見つかりません", "1;31"))
+    for runtime in runtime_list:
+        mark = c("✔", "1;32") if runtime.usable else c("✘", "1;31")
+        print("  %s %-9s %-30s compose: %s"
+              % (mark, runtime.name, runtime.version or "-", runtime.compose_display))
+        if not runtime.usable:
+            print("      %s" % c(T.trim_to_width(runtime.reason, width - 6), "31"))
+        elif runtime.rootless:
+            print("      rootless モードです "
+                  "(コンテナ IP へはホストから直接届きません)")
+
+    runtime = _runtime()
+    table = {}
+    stopped = []
+    section("コンテナの状態", width)
+    if runtime is None:
+        print("  " + c("使えるランタイムが無いため確認できません", "1;31"))
+    else:
+        table, result = P.containers(runtime.name)
+        if not table:
+            print("  " + c("コンテナ一覧を取得できませんでした: %s"
+                           % (result.message if result else "?"), "1;31"))
+        for name in P.ALL_CONTAINERS:
+            row = table.get(name)
+            if row is None:
+                stopped.append((name, "存在しません"))
+                print("  %s %-22s %s" % (c("✘", "1;31"), name, "(存在しません)"))
+            elif row["state"].lower() != "running":
+                stopped.append((name, row["status"] or row["state"]))
+                print("  %s %-22s %s" % (c("✘", "1;31"), name, row["status"]))
+            else:
+                print("  %s %-22s %-16s %s" % (c("✔", "1;32"), name, row["status"],
+                                               T.trim_to_width(row["ports"], width - 46)))
+        for name, _why in stopped[:2]:
+            logs = P.container_logs(runtime.name, name, 6)
+            if logs:
+                print("  %s のログ末尾:" % c(name, "1"))
+                for line in logs:
+                    print("    | " + T.trim_to_width(line, width - 6))
+
+    section("接続確認", width)
+    reachable, unreachable = [], []
+    for key, url, method in rows:
+        resp = _probe(url, method)
+        if resp.error:
+            unreachable.append(key)
+            print("  %s %s %s" % (c("✘", "1;31"), _label(key, 20), url))
+            print("      %s" % c(P.explain_error_text(resp.error) or resp.error, "31"))
+            for attempt in _ATTEMPTS.get(key, []):
+                if not attempt.ok:
+                    print("      ・%s %s"
+                          % (_label(attempt.url or "[%s]" % attempt.source, 44),
+                             attempt.detail))
+        else:
+            reachable.append(key)
+            source = _ENDPOINTS[key].source if key in _ENDPOINTS else ""
+            print("  %s %s %s HTTP %s  [%s]"
+                  % (c("✔", "1;32"), _label(key, 20),
+                     _label(T.trim_to_width(url, 44), 44), resp.status, source))
+
+    section("診断", width)
+    compose = runtime.compose_display if (runtime and runtime.compose) else "docker compose"
+    if not unreachable:
+        print("  " + c("✔ 検証環境へ到達できています。ブラウザ無しで次のとおり確認できます:",
+                       "1;32"))
+        print("      ./scripts/mctl.sh on intraweb")
+        print("      ./scripts/report.sh check intraweb /dashboard    # 画面をテキスト描画")
+        print("      ./scripts/report.sh report                       # 全シナリオ + Excel")
+    else:
+        if runtime is None and not runtime_list:
+            print("  " + c("✘ コンテナランタイム (docker / podman / nerdctl) が"
+                           "インストールされていません。", "1;31"))
+            print("      RHEL 9: sudo dnf install -y podman podman-compose")
+            print("      その後: podman compose up -d --build")
+        elif runtime is None:
+            print("  " + c("✘ ランタイムはありますが使える状態ではありません。", "1;31"))
+            for entry in runtime_list:
+                print("      %s: %s" % (entry.name,
+                                        T.trim_to_width(entry.reason, width - 12)))
+            print("      デーモン起動: sudo systemctl start docker  "
+                  "(podman なら systemctl --user start podman.socket)")
+            print("      権限不足なら: sudo usermod -aG docker $USER   → 再ログイン")
+        elif stopped:
+            print("  " + c("✘ 起動していないコンテナが %d 件あります。"
+                           "これが接続拒否の原因です。" % len(stopped), "1;31"))
+            print("      %s up -d --build" % compose)
+            print("      %s logs --tail 50 %s" % (runtime.name, stopped[0][0]))
+            if info["selinux"] == "Enforcing":
+                print("  " + c("・SELinux が Enforcing です。", "1;33")
+                      + "バインドマウントが読めずに ALB が起動しない場合は、")
+                print("      %s -f docker-compose.yml -f docker-compose.selinux.yml "
+                      "up -d --build" % compose)
+                print("    (:z 付きでマウントし直すオーバーレイを同梱しています)")
+        else:
+            print("  " + c("✘ コンテナは動いていますが、このプロセスからは届きません。", "1;31"))
+            print("      ・ホストのポート公開を確認 : %s port alb-intraweb" % runtime.name)
+            if runtime.rootless:
+                print("      ・rootless のためコンテナ IP には直接届きません。"
+                      "コンテナの中から実行してください:")
+            print("      ・コンテナの中から実行     : "
+                  + c("./scripts/report.sh --in-container check intraweb /dashboard", "1;36"))
+
+    section("他のスクリプトにも同じ接続先を使わせる", width)
+    print("  # 下記を export すると mctl.sh / verify.sh / report.sh が同じ宛先を使います")
+    for service in SERVICES:
+        print("  export %-38s %s"
+              % ("ALB_URL_%s=%s" % (service.upper(), alb_url(service)),
+                 "ADMIN_URL_%s=%s" % (service.upper(), admin_url(service))))
+    print()
+    return EXIT_OK if not unreachable else EXIT_UNREACHABLE
 
 
 # ---------------------------------------------------------------------------
@@ -873,7 +1284,7 @@ def _write_excel(runs, path):
 
 
 def main(argv=None):
-    global COLOR
+    global COLOR, AUTODISCOVER
     parser = argparse.ArgumentParser(
         prog="albcheck", description="ALB × Lambda メンテナンス応答の呼び出し確認ツール")
     parser.add_argument("--width", type=int, default=int(os.environ.get("ALBCHECK_WIDTH", "88")),
@@ -882,6 +1293,8 @@ def main(argv=None):
                         choices=["builtin", "auto", "w3m", "lynx", "links"],
                         help="HTML 描画に使うテキストブラウザ (既定 builtin)")
     parser.add_argument("--no-color", action="store_true", help="ANSI 色を使わない")
+    parser.add_argument("--no-autodiscover", action="store_true",
+                        help="接続先の自動検出をせず localhost だけを使う")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("check", help="1 リクエストのレスポンス詳細と画面表示")
@@ -893,6 +1306,10 @@ def main(argv=None):
     p.add_argument("--raw", action="store_true", help="本文の生データも表示")
     p.add_argument("--no-screen", action="store_true", help="画面表示を省略")
     p.add_argument("--excel", help="この 1 件を Excel に出力")
+    p.add_argument("--save", metavar="FILE",
+                   help="レスポンス本文をそのまま保存 (例 screen.html)")
+    p.add_argument("--save-text", metavar="FILE",
+                   help="画面のテキスト描画結果を保存 (例 screen.txt)")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("report", help="全シナリオを検証して Excel レポートを出力")
@@ -924,8 +1341,15 @@ def main(argv=None):
     p.add_argument("-H", "--header", action="append")
     p.set_defaults(func=cmd_render)
 
+    p = sub.add_parser("doctor", help="接続できないときの原因切り分け (GUI 不要)")
+    p.add_argument("--quiet", action="store_true",
+                   help="1 行だけ表示して終了コードで返す (ラッパ用)")
+    p.set_defaults(func=cmd_doctor)
+
     args = parser.parse_args(argv)
     COLOR = T.enable_ansi() and not args.no_color
+    if args.no_autodiscover:
+        AUTODISCOVER = False
     try:
         return args.func(args)
     except KeyboardInterrupt:
