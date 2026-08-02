@@ -57,6 +57,15 @@ function Set-Maint {
   }
 }
 
+function Set-LambdaVariant {
+  param([string[]]$Service, [string]$Variant)
+  $body = @{ variant = $Variant; note = 'verify' } | ConvertTo-Json -Compress
+  foreach ($s in @($Service)) {
+    Invoke-RestMethod "http://localhost:$($Adm[$s])/admin/lambda" -Method Post `
+      -Body $body -ContentType 'application/json' | Out-Null
+  }
+}
+
 Write-Host "`n=== 0. 事前準備: 全 ALB を通常モードへ ===" -ForegroundColor Cyan
 foreach ($s in $Alb.Keys) { Set-Maint $s $false }
 Start-Sleep -Milliseconds 300
@@ -137,7 +146,42 @@ Assert "interapi のみ復旧 -> 200" ($r1.Status -eq 200) "actual=$($r1.Status)
 Assert "intraapi はメンテ継続 -> 503" ($r2.Status -eq 503) "actual=$($r2.Status)"
 
 # ---------------------------------------------------------------------------
-Write-Host "`n=== 5. 後片付け: 全 ALB を通常モードへ ===" -ForegroundColor Cyan
+Write-Host "`n=== 5. Lambda 実装の差し替え (builtin <-> custom) ===" -ForegroundColor Cyan
+Set-Maint 'intraweb' $true
+Set-Maint 'sfapi' $true
+Start-Sleep -Milliseconds 200
+
+Write-Host "`n--- 5-1. 既定は同梱実装 (builtin) ---"
+Set-LambdaVariant @('intraweb', 'sfapi') 'builtin'
+$r = Get-Res "http://localhost:8081/dashboard"
+Assert "intraweb : X-Alb-Lambda-Variant = builtin" ($r.Headers['X-Alb-Lambda-Variant'] -eq 'builtin') "actual=$($r.Headers['X-Alb-Lambda-Variant'])"
+
+Write-Host "`n--- 5-2. 自作 Lambda (custom) へ差し替え ---"
+Set-LambdaVariant @('intraweb', 'sfapi') 'custom'
+Start-Sleep -Milliseconds 200
+$r = Get-Res "http://localhost:8081/dashboard"
+Assert "intraweb : 差し替え後も 503" ($r.Status -eq 503) "actual=$($r.Status)"
+Assert "intraweb : 自作 Lambda が応答" ($r.Headers['X-Alb-Lambda-Variant'] -eq 'custom') "actual=$($r.Headers['X-Alb-Lambda-Variant'])"
+Assert "intraweb : 自作実装の目印ヘッダ" ($r.Headers['X-Maintenance-Impl'] -eq 'custom') "actual=$($r.Headers['X-Maintenance-Impl'])"
+Assert "intraweb : web なので HTML" ($r.Headers['Content-Type'] -like 'text/html*') "actual=$($r.Headers['Content-Type'])"
+Assert "intraweb : 適用ルールは変わらない" ($r.Headers['X-Alb-Matched-Rule'] -eq 'maintenance-catch-all') "actual=$($r.Headers['X-Alb-Matched-Rule'])"
+
+$r = Get-Res "http://localhost:8084/v1/orders"
+Assert "sfapi : 自作 Lambda が応答" ($r.Headers['X-Alb-Lambda-Variant'] -eq 'custom') "actual=$($r.Headers['X-Alb-Lambda-Variant'])"
+Assert "sfapi : api なので JSON" ($r.Headers['Content-Type'] -like 'application/json*') "actual=$($r.Headers['Content-Type'])"
+Assert "sfapi : HTML ではない" ($r.Body -notmatch '<html') ""
+$json = $r.Body | ConvertFrom-Json
+Assert "sfapi : 自作 Lambda もサービスを識別" ($json.error.service -eq 'sfapi') "actual=$($json.error.service)"
+
+Write-Host "`n--- 5-3. 同梱実装 (builtin) へ戻す ---"
+Set-LambdaVariant @('intraweb', 'sfapi') 'builtin'
+Start-Sleep -Milliseconds 200
+$r = Get-Res "http://localhost:8081/dashboard"
+Assert "intraweb : builtin に戻る" ($r.Headers['X-Alb-Lambda-Variant'] -eq 'builtin') "actual=$($r.Headers['X-Alb-Lambda-Variant'])"
+Assert "intraweb : 目印ヘッダが消える" ($null -eq $r.Headers['X-Maintenance-Impl']) "actual=$($r.Headers['X-Maintenance-Impl'])"
+
+# ---------------------------------------------------------------------------
+Write-Host "`n=== 6. 後片付け: 全 ALB を通常モードへ ===" -ForegroundColor Cyan
 foreach ($s in $Alb.Keys) { Set-Maint $s $false }
 Start-Sleep -Milliseconds 200
 foreach ($s in @('intraweb', 'interapi', 'intraapi', 'sfapi')) {

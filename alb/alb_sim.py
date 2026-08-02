@@ -9,6 +9,13 @@ ALB (Application Load Balancer) シミュレータ
 ポート:
   LISTENER_PORT (default 80)  : 本番トラフィック用リスナー
   ADMIN_PORT    (default 9000): メンテナンスモード切替などの管理 API
+
+Lambda バリアント:
+  1 つの Lambda ターゲットグループに複数の invoke 先 (variant) を定義でき、
+  管理 API から無停止で切り替えられる。ターゲットグループ ARN は変わらないため、
+  自作 Lambda にも「実 ALB とまったく同じイベント」が渡る。
+    endpoint:  variant=builtin の invoke 先 (既定)
+    variants:  追加の invoke 先 (例 custom: 自作 Lambda コンテナ)
 """
 
 import fnmatch
@@ -34,6 +41,9 @@ STATE_DIR = os.environ.get("STATE_DIR", "/state")
 LISTENER_PORT = int(os.environ.get("LISTENER_PORT", "80"))
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "9000"))
 BACKEND_TIMEOUT = float(os.environ.get("BACKEND_TIMEOUT", "10"))
+# Lambda ターゲットグループの既定 invoke 先を表す variant 名 (= YAML の endpoint)
+BUILTIN_VARIANT = os.environ.get("BUILTIN_LAMBDA_VARIANT", "builtin")
+LAMBDA_VARIANT_DEFAULT = os.environ.get("LAMBDA_VARIANT_DEFAULT", BUILTIN_VARIANT)
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -113,6 +123,78 @@ class Config:
 
     def maintenance_on(self):
         return self.get_state()["maintenance"]
+
+    # ---- Lambda バリアント (invoke 先の差し替え) ----
+    @staticmethod
+    def tg_variants(tg):
+        """ターゲットグループの variant 名 -> invoke URL。
+        YAML の endpoint が既定 variant (builtin)、variants: が追加分。"""
+        variants = {}
+        if tg.get("endpoint"):
+            variants[BUILTIN_VARIANT] = tg["endpoint"]
+        variants.update(tg.get("variants") or {})
+        return variants
+
+    def lambda_variants(self):
+        """この ALB の設定に登場する Lambda variant 名を定義順で返す。"""
+        names = []
+        for tg in self.target_groups.values():
+            if tg.get("type") != "lambda":
+                continue
+            for name in self.tg_variants(tg):
+                if name not in names:
+                    names.append(name)
+        return names or [BUILTIN_VARIANT]
+
+    @property
+    def variant_file(self):
+        return os.path.join(STATE_DIR, f"lambda-variant-{self.service}.json")
+
+    def get_variant(self):
+        try:
+            with open(self.variant_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if state.get("variant") in self.lambda_variants():
+                return state
+        except (OSError, ValueError):
+            pass
+        default = LAMBDA_VARIANT_DEFAULT
+        if default not in self.lambda_variants():
+            default = self.lambda_variants()[0]
+        return self.set_variant(default, "default")
+
+    def set_variant(self, variant, note=""):
+        available = self.lambda_variants()
+        if variant not in available:
+            raise ValueError(
+                "unknown lambda variant: %s (available: %s)" % (variant, ", ".join(available))
+            )
+        state = {
+            "variant": variant,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "note": note,
+        }
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = self.variant_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, self.variant_file)
+        log.info("[%s] lambda variant -> %s (%s)", self.alb_name, variant, note)
+        return state
+
+    def resolve_lambda(self, tg):
+        """現在の variant に対応する invoke URL を返す。
+        その TG に未定義の variant なら既定 (builtin) にフォールバックする。"""
+        variants = self.tg_variants(tg)
+        current = self.get_variant()["variant"]
+        if current in variants:
+            return variants[current], current
+        fallback = BUILTIN_VARIANT if BUILTIN_VARIANT in variants else next(iter(variants))
+        log.warning(
+            "[%s] variant '%s' is not defined for this target group; falling back to '%s'",
+            self.alb_name, current, fallback,
+        )
+        return variants[fallback], fallback
 
 
 cfg = Config(CONFIG_PATH)
@@ -243,10 +325,10 @@ def build_elb_event(tg, trace_id):
     }
 
 
-def invoke_lambda(tg, trace_id):
+def invoke_lambda(tg, endpoint, trace_id):
     event = build_elb_event(tg, trace_id)
     try:
-        r = requests.post(tg["endpoint"], json=event, timeout=BACKEND_TIMEOUT)
+        r = requests.post(endpoint, json=event, timeout=BACKEND_TIMEOUT)
     except requests.RequestException as e:
         log.error("lambda invoke error: %s", e)
         return alb_502("Lambda invoke failed")
@@ -338,11 +420,15 @@ def handle(_path):
     rule, action = select_rule()
 
     atype = action["type"]
+    variant = None
     if atype == "forward":
         tg_name = action["target_group"]
         tg = cfg.target_groups[tg_name]
         if tg["type"] == "lambda":
-            resp = invoke_lambda(tg, trace_id)
+            endpoint, variant = cfg.resolve_lambda(tg)
+            resp = invoke_lambda(tg, endpoint, trace_id)
+            resp.headers["X-Alb-Lambda-Variant"] = variant
+            resp.headers["X-Alb-Lambda-Endpoint"] = endpoint
         else:
             resp = forward_to_ecs(tg, trace_id)
         target_desc = f"{tg_name}({tg['type']})"
@@ -356,6 +442,7 @@ def handle(_path):
         resp = alb_502(f"unsupported action {atype}")
         target_desc = "unsupported"
 
+    elapsed_ms = (time.time() - started) * 1000
     resp.headers["X-Amzn-Trace-Id"] = trace_id
     # 検証しやすいように、どのルールでどこへ流れたかをレスポンスヘッダにも出す
     resp.headers["X-Alb-Name"] = cfg.alb_name
@@ -363,9 +450,10 @@ def handle(_path):
     resp.headers["X-Alb-Rule-Priority"] = str(rule["priority"])
     resp.headers["X-Alb-Target"] = target_desc
     resp.headers["X-Alb-Maintenance"] = str(cfg.maintenance_on()).lower()
+    resp.headers["X-Alb-Duration-Ms"] = f"{elapsed_ms:.1f}"
 
     log.info(
-        'ALB=%s maint=%s client=%s "%s %s" rule=%s(prio=%s) target=%s status=%s %.1fms',
+        'ALB=%s maint=%s client=%s "%s %s" rule=%s(prio=%s) target=%s%s status=%s %.1fms',
         cfg.alb_name,
         cfg.maintenance_on(),
         client_ip(),
@@ -374,8 +462,9 @@ def handle(_path):
         rule["name"],
         rule["priority"],
         target_desc,
+        f" variant={variant}" if variant else "",
         resp.status_code,
-        (time.time() - started) * 1000,
+        elapsed_ms,
     )
     return resp
 
@@ -389,6 +478,7 @@ admin_app = Flask("admin")
 @admin_app.get("/admin/state")
 def admin_state():
     st = cfg.get_state()
+    vs = cfg.get_variant()
     return jsonify(
         {
             "alb": cfg.alb_name,
@@ -396,6 +486,8 @@ def admin_state():
             "maintenance": st["maintenance"],
             "updated_at": st["updated_at"],
             "note": st["note"],
+            "lambda_variant": vs["variant"],
+            "lambda_variant_updated_at": vs["updated_at"],
         }
     )
 
@@ -419,6 +511,49 @@ def admin_off():
     return jsonify({"alb": cfg.alb_name, **cfg.set_state(False, "admin off")})
 
 
+@admin_app.get("/admin/lambda")
+def admin_lambda_get():
+    """現在の Lambda invoke 先 (variant) と、選択できる variant の一覧。"""
+    vs = cfg.get_variant()
+    targets = {}
+    for name, tg in cfg.target_groups.items():
+        if tg.get("type") != "lambda":
+            continue
+        endpoint, effective = cfg.resolve_lambda(tg)
+        targets[name] = {
+            "target_group_arn": tg.get("target_group_arn", ""),
+            "variants": cfg.tg_variants(tg),
+            "effective_variant": effective,
+            "effective_endpoint": endpoint,
+        }
+    return jsonify(
+        {
+            "alb": cfg.alb_name,
+            "service": cfg.service,
+            "variant": vs["variant"],
+            "updated_at": vs["updated_at"],
+            "note": vs.get("note", ""),
+            "available": cfg.lambda_variants(),
+            "target_groups": targets,
+        }
+    )
+
+
+@admin_app.post("/admin/lambda")
+def admin_lambda_set():
+    """自作 Lambda へ差し替える: {"variant": "custom"}"""
+    data = request.get_json(silent=True) or {}
+    variant = data.get("variant")
+    if not variant:
+        return jsonify({"error": 'body must be {"variant": "<name>"}',
+                        "available": cfg.lambda_variants()}), 400
+    try:
+        st = cfg.set_variant(variant, data.get("note", "admin"))
+    except ValueError as e:
+        return jsonify({"error": str(e), "available": cfg.lambda_variants()}), 400
+    return jsonify({"alb": cfg.alb_name, "service": cfg.service, **st})
+
+
 @admin_app.get("/admin/rules")
 def admin_rules():
     maint = cfg.maintenance_on()
@@ -439,6 +574,7 @@ def admin_rules():
         {
             "alb": cfg.alb_name,
             "maintenance": maint,
+            "lambda_variant": cfg.get_variant()["variant"],
             "rules": rules,
             "default_action": cfg.default_action,
             "target_groups": cfg.target_groups,
@@ -462,11 +598,13 @@ def main():
         daemon=True,
     ).start()
     log.info(
-        "[%s] listener :%s / admin :%s (service=%s)",
+        "[%s] listener :%s / admin :%s (service=%s, lambda variant=%s, available=%s)",
         cfg.alb_name,
         LISTENER_PORT,
         ADMIN_PORT,
         cfg.service,
+        cfg.get_variant()["variant"],
+        ",".join(cfg.lambda_variants()),
     )
     # clear_untrusted_proxy_headers=False:
     #   waitress は既定で X-Forwarded-* を削除するため、source-ip 条件の検証用に無効化する

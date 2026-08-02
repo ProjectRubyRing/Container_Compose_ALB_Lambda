@@ -12,6 +12,22 @@ Lambda は **AWS 公式 Lambda ベースイメージ（RIE 同梱）** で動作
 **実 ALB と同じ Lambda ターゲットグループ統合のイベント形式／レスポンス形式**でやり取りします。
 つまり、ここで動いた `lambda/app.py` はそのまま AWS の Lambda にデプロイできます。
 
+さらに次のことができます。
+
+- **Lambda を自作のものに差し替えて検証する** — `lambda-custom/app.py` に自分の実装を書き、
+  ターゲットグループ ARN はそのままに invoke 先だけを切り替えます。実 ALB からの呼び出しと
+  同一のイベントで自作関数を試せ、ALB 統合の契約を満たしているか自動チェックもできます。
+  → [11 章](#11-lambda-を自作のものに差し替えて検証する)
+- **メンテナンス画面をテキストブラウザ風にターミナル表示する** — ブラウザを開かずに
+  「利用者に何が見えるか」を確認できます（全角文字でも枠が崩れません）。
+  → [9 章](#9-呼び出し確認ツール-albcheck画面表示とレスポンス詳細)
+- **レスポンスの詳細と検証結果を Excel に出力する** — ステータス・全ヘッダ・本文・判定に加え、
+  **描画した画面そのもの**もシートに残るので、そのままエビデンスにできます。
+  → [10 章](#10-excel-レポートを出力する)
+
+検証ツールは **Python 標準ライブラリのみ**で動くため `pip install` は不要です
+（ホストに Python が無い場合は同梱の `inspector` コンテナで実行できます）。
+
 ---
 
 ## 目次
@@ -24,16 +40,19 @@ Lambda は **AWS 公式 Lambda ベースイメージ（RIE 同梱）** で動作
 6. [メンテナンスモードの切り替え方](#6-メンテナンスモードの切り替え方)
 7. [手動での動作確認手順（コピペ用）](#7-手動での動作確認手順コピペ用)
 8. [自動検証スクリプト](#8-自動検証スクリプト)
-9. [リスナールールの仕組みと書き方](#9-リスナールールの仕組みと書き方)
-10. [Lambda がどうやって Web/API を判定しているか](#10-lambda-がどうやって-webapi-を判定しているか)
-11. [Lambda を単体で叩く（ALB を経由しない）](#11-lambda-を単体で叩くalb-を経由しない)
-12. [レスポンスヘッダで挙動をデバッグする](#12-レスポンスヘッダで挙動をデバッグする)
-13. [ログの見方](#13-ログの見方)
-14. [カスタマイズ方法](#14-カスタマイズ方法)
-15. [本番 AWS への持っていき方](#15-本番-aws-への持っていき方)
-16. [トラブルシューティング](#16-トラブルシューティング)
-17. [環境の停止・削除](#17-環境の停止削除)
-18. [この環境で再現できること／できないこと](#18-この環境で再現できることできないこと)
+9. [呼び出し確認ツール albcheck（画面表示とレスポンス詳細）](#9-呼び出し確認ツール-albcheck画面表示とレスポンス詳細)
+10. [Excel レポートを出力する](#10-excel-レポートを出力する)
+11. [Lambda を自作のものに差し替えて検証する](#11-lambda-を自作のものに差し替えて検証する)
+12. [リスナールールの仕組みと書き方](#12-リスナールールの仕組みと書き方)
+13. [Lambda がどうやって Web/API を判定しているか](#13-lambda-がどうやって-webapi-を判定しているか)
+14. [Lambda を単体で叩く（ALB を経由しない）](#14-lambda-を単体で叩くalb-を経由しない)
+15. [レスポンスヘッダで挙動をデバッグする](#15-レスポンスヘッダで挙動をデバッグする)
+16. [ログの見方](#16-ログの見方)
+17. [カスタマイズ方法](#17-カスタマイズ方法)
+18. [本番 AWS への持っていき方](#18-本番-aws-への持っていき方)
+19. [トラブルシューティング](#19-トラブルシューティング)
+20. [環境の停止・削除](#20-環境の停止削除)
+21. [この環境で再現できること／できないこと](#21-この環境で再現できることできないこと)
 
 ---
 
@@ -54,15 +73,21 @@ Lambda は **AWS 公式 Lambda ベースイメージ（RIE 同梱）** で動作
 
                               ※ Lambda は 4 ALB 共有の 1 関数（maintenance-lambda）
                                  呼び出し元のターゲットグループ ARN で web/api を判定
+                              ※ invoke 先は builtin(同梱) / custom(自作) を無停止で切替可
 ```
 
-コンテナ一覧（9 個）:
+コンテナ一覧（常時 10 個 + ツール 1 個）:
 
 | コンテナ | 役割 |
 |---|---|
 | `alb-intraweb` / `alb-interapi` / `alb-intraapi` / `alb-sfapi` | ALB シミュレータ（リスナールール評価・フォワード・Lambda invoke） |
 | `ecs-intraweb` / `ecs-interapi` / `ecs-intraapi` / `ecs-sfapi` | ECS サービスのモック（通常時の応答） |
 | `maintenance-lambda` | メンテナンス応答 Lambda（AWS 公式 Lambda イメージ + RIE） |
+| `custom-lambda` | **自作 Lambda**（差し替え検証用 / `lambda-custom/app.py`） |
+| `inspector` | 検証ツール albcheck 実行用（`profiles: tools` なので `run` したときだけ起動） |
+
+メンテナンス中にどちらの Lambda が呼ばれるかは ALB ごとに切り替えられます。
+ターゲットグループ ARN は同じものが渡るため、自作 Lambda にも実 ALB と同一のイベントが届きます。
 
 ---
 
@@ -75,7 +100,14 @@ Lambda は **AWS 公式 Lambda ベースイメージ（RIE 同梱）** で動作
 | intraapi（API） | http://localhost:8083 | http://localhost:9083 | `intraapi:8080`（内部のみ） |
 | sfapi（API） | http://localhost:8084 | http://localhost:9084 | `sfapi:8080`（内部のみ） |
 
-Lambda 直接 invoke 用: `http://localhost:9001/2015-03-31/functions/function/invocations`
+Lambda 直接 invoke 用（RIE）:
+
+| Lambda 実装 (variant) | コンテナ | invoke URL |
+|---|---|---|
+| `builtin`（既定 / 同梱実装） | `maintenance-lambda` | `http://localhost:9001/2015-03-31/functions/function/invocations` |
+| `custom`（自作実装） | `custom-lambda` | `http://localhost:9002/2015-03-31/functions/function/invocations` |
+
+どちらの Lambda を呼ぶかは ALB ごとに切り替えられます（→ [11 章](#11-lambda-を自作のものに差し替えて検証する)）。
 
 ---
 
@@ -87,7 +119,11 @@ Lambda 直接 invoke 用: `http://localhost:9001/2015-03-31/functions/function/i
   - Windows PowerShell（同梱の `.ps1` スクリプト）
   - bash + curl（Git Bash / WSL / macOS / Linux。同梱の `.sh` スクリプト）
 
-> ポート 8081-8084 / 9001 / 9081-9084 が空いている必要があります。使用中の場合は
+- （任意）Python 3.8 以上 … `scripts/report.ps1` / `report.sh` をホストで直接動かす場合。
+  **入っていなくても構いません**（自動で `inspector` コンテナにフォールバックします）。
+  追加パッケージのインストールは不要です。
+
+> ポート 8081-8084 / 9001 / 9002 / 9081-9084 が空いている必要があります。使用中の場合は
 > `docker-compose.yml` の `ports:` を書き換えてください。
 
 ---
@@ -98,11 +134,14 @@ Lambda 直接 invoke 用: `http://localhost:9001/2015-03-31/functions/function/i
 # 1) このディレクトリで起動（初回は数分かかります）
 docker compose up -d --build
 
-# 2) 起動確認（9 コンテナすべて Up になっていること）
+# 2) 起動確認（10 コンテナすべて Up になっていること）
 docker compose ps
 
-# 3) 全シナリオ自動検証（PASS=53 / FAIL=0 になれば成功）
+# 3) 全シナリオ自動検証（PASS=65 / FAIL=0 になれば成功）
 powershell -ExecutionPolicy Bypass -File .\scripts\verify.ps1
+
+# 4) 画面表示つきの検証 + Excel レポート出力（reports\ に xlsx が出ます）
+.\scripts\report.ps1 report
 ```
 
 bash 環境の場合:
@@ -110,8 +149,18 @@ bash 環境の場合:
 ```bash
 docker compose up -d --build
 docker compose ps
-bash scripts/verify.sh          # PASS=35 / FAIL=0
+bash scripts/verify.sh          # PASS=44 / FAIL=0 になれば成功
+./scripts/report.sh report      # 画面表示つき検証 + Excel レポート
 ```
+
+やりたいことから引く早見表:
+
+| やりたいこと | コマンド | 参照 |
+|---|---|---|
+| メンテ画面が実際どう見えるか確認したい | `.\scripts\report.ps1 check intraweb /dashboard` | [9 章](#9-呼び出し確認ツール-albcheck画面表示とレスポンス詳細) |
+| 検証結果を Excel で残したい | `.\scripts\report.ps1 report` | [10 章](#10-excel-レポートを出力する) |
+| 自作の Lambda で検証したい | `lambda-custom\app.py` を編集 → `.\scripts\mctl.ps1 lambda custom` | [11 章](#11-lambda-を自作のものに差し替えて検証する) |
+| メンテナンスを ON/OFF したい | `.\scripts\mctl.ps1 on intraweb` | [6 章](#6-メンテナンスモードの切り替え方) |
 
 ---
 
@@ -119,7 +168,7 @@ bash scripts/verify.sh          # PASS=35 / FAIL=0
 
 ```
 Container_Compose_ALB_Lambda/
-├─ docker-compose.yml            … 全コンテナ定義（ALB4台 + ECS4台 + Lambda1台）
+├─ docker-compose.yml            … 全コンテナ定義（ALB4台 + ECS4台 + Lambda2台 + ツール1台）
 ├─ README.md                     … このファイル
 ├─ alb/                          … ALB シミュレータ
 │  ├─ Dockerfile
@@ -132,13 +181,25 @@ Container_Compose_ALB_Lambda/
 │     └─ sfapi.yaml
 ├─ lambda/                       … メンテナンス応答 Lambda（AWS へそのまま持ち込める）
 │  ├─ Dockerfile                 … public.ecr.aws/lambda/python:3.12
-│  └─ app.py                     … handler(event, context)
+│  └─ app.py                     … handler(event, context)        ★ variant=builtin
+├─ lambda-custom/                … 自作 Lambda（差し替え検証用）  ★ variant=custom
+│  ├─ Dockerfile                 … builtin と同じ公式ベースイメージ
+│  ├─ requirements.txt           … 追加ライブラリが必要ならここに
+│  └─ app.py                     … ここを自分の実装に書き換える
 ├─ backend/                      … ECS サービスのモック（4 サービス共通イメージ）
 │  ├─ Dockerfile
 │  └─ app.py
+├─ tools/                        … 検証ツール（pip install 不要・標準ライブラリのみ）
+│  ├─ Dockerfile                 … inspector コンテナ（w3m / lynx 同梱）
+│  ├─ albcheck.py                … CLI 本体（check / report / contract / variant / render）
+│  ├─ textrender.py              … HTML・JSON をテキストブラウザ風に描画（全角幅対応）
+│  ├─ report_excel.py            … 検証結果と画面表示を Excel シートへ
+│  └─ xlsxlite.py                … 依存なしの最小 xlsx ライタ
+├─ reports/                      … 出力された Excel レポートの置き場所
 └─ scripts/
-   ├─ mctl.ps1 / mctl.sh         … メンテナンスモード切替ツール
-   └─ verify.ps1 / verify.sh     … 全シナリオ自動検証
+   ├─ mctl.ps1 / mctl.sh         … メンテナンスモード切替 + Lambda 差し替え
+   ├─ verify.ps1 / verify.sh     … 全シナリオ自動検証（アサーションのみ）
+   └─ report.ps1 / report.sh     … albcheck のラッパ（画面表示 + Excel レポート）
 ```
 
 ---
@@ -160,6 +221,9 @@ PowerShell:
 .\scripts\mctl.ps1 on  all               # 4 ALB すべてをメンテナンス中に
 .\scripts\mctl.ps1 off all               # 4 ALB すべてを通常に
 .\scripts\mctl.ps1 rules sfapi           # sfapi ALB の現在のリスナールールを表示
+.\scripts\mctl.ps1 lambda                # 各 ALB が呼ぶ Lambda 実装を表示
+.\scripts\mctl.ps1 lambda custom         # 全 ALB を自作 Lambda へ差し替え
+.\scripts\mctl.ps1 lambda builtin sfapi  # sfapi だけ同梱実装へ戻す
 ```
 
 bash:
@@ -169,15 +233,16 @@ bash:
 ./scripts/mctl.sh on  intraweb
 ./scripts/mctl.sh off all
 ./scripts/mctl.sh rules sfapi
+./scripts/mctl.sh lambda custom
 ```
 
-`status` の出力例:
+`status` の出力例（`lambda=` が現在の Lambda 実装）:
 
 ```
-intraweb   MAINTENANCE  updated=2026-07-22T13:33:45+0000 admin on
-interapi   NORMAL       updated=2026-07-22T13:34:02+0000 admin off
-intraapi   NORMAL       updated=2026-07-22T13:34:02+0000 admin off
-sfapi      NORMAL       updated=2026-07-22T13:34:02+0000 admin off
+intraweb   MAINTENANCE  lambda=builtin  updated=2026-07-22T13:33:45+0000 admin on
+interapi   NORMAL       lambda=builtin  updated=2026-07-22T13:34:02+0000 admin off
+intraapi   NORMAL       lambda=custom   updated=2026-07-22T13:34:02+0000 admin off
+sfapi      NORMAL       lambda=builtin  updated=2026-07-22T13:34:02+0000 admin off
 ```
 
 ### 6-2. 管理 API を直接叩く
@@ -189,6 +254,8 @@ sfapi      NORMAL       updated=2026-07-22T13:34:02+0000 admin off
 | POST | `/admin/maintenance/off` | メンテナンス OFF |
 | POST | `/admin/maintenance` | `{"enabled":true,"note":"リリース作業"}` で理由付き設定 |
 | GET | `/admin/rules` | 適用中のリスナールール一覧（`active_now` 付き） |
+| GET | `/admin/lambda` | 現在の Lambda 実装（variant）と選択肢・invoke 先 URL |
+| POST | `/admin/lambda` | `{"variant":"custom"}` で invoke 先 Lambda を差し替え |
 | POST | `/admin/reload` | YAML を再読込（コンテナ再起動なしでルール変更を反映） |
 
 ```powershell
@@ -205,6 +272,11 @@ curl -s -X POST http://localhost:9081/admin/maintenance/on
 curl -s -X POST http://localhost:9081/admin/maintenance \
      -H 'Content-Type: application/json' \
      -d '{"enabled":true,"note":"2026-08-01 定期リリース"}'
+
+# invoke 先 Lambda の確認と差し替え
+curl -s http://localhost:9081/admin/lambda
+curl -s -X POST http://localhost:9081/admin/lambda \
+     -H 'Content-Type: application/json' -d '{"variant":"custom"}'
 ```
 
 ### 6-3. 起動時からメンテナンス中にしたい
@@ -368,13 +440,295 @@ powershell -ExecutionPolicy Bypass -File .\scripts\verify.ps1
 | 3-2 | intraapi | 正しい運用ヘッダで 200 / 誤ったヘッダで 503 |
 | 3-3 | sfapi | `/internal/*` は ALB の fixed-response |
 | 4 | 独立性 | interapi だけ復旧しても intraapi はメンテ継続 |
-| 5 | 復旧 | 全 ALB を OFF にして 200 に戻る |
+| 5 | Lambda 差し替え | `builtin` → `custom` へ切り替えると自作 Lambda が応答し（`X-Alb-Lambda-Variant`）、web は HTML・api は JSON のまま。`builtin` に戻せることも確認 |
+| 6 | 復旧 | 全 ALB を OFF にして 200 に戻る |
 
 終了コードは全 PASS で `0`、1 件でも失敗すると `1`（CI に組み込めます）。
+アサーション件数は PowerShell 版が 65 件、bash 版が 44 件です。
+
+### verify と report の使い分け
+
+| | `verify.ps1` / `verify.sh` | `report.ps1 report`（albcheck） |
+|---|---|---|
+| 目的 | 合否だけを素早く確認（CI 向け） | 画面表示・レスポンス詳細まで確認し、記録を残す |
+| 出力 | PASS/FAIL の一覧 | 端末表示 + **Excel レポート**（7 シート） |
+| 必要なもの | PowerShell / curl | Python 3.8 以上（無ければ `inspector` コンテナ） |
+| Lambda 差し替え検証 | あり（builtin ⇄ custom の切り替え） | あり（`--variant both` で両実装を通しで比較） |
+
+どちらも実行後に全 ALB を通常モードへ戻します。
 
 ---
 
-## 9. リスナールールの仕組みと書き方
+## 9. 呼び出し確認ツール albcheck（画面表示とレスポンス詳細）
+
+`tools/albcheck.py` は「メンテナンス応答が実際どう見えるか」「レスポンスの中身がどうなって
+いるか」をターミナルで確認するためのツールです。**pip install は不要**（Python 標準ライブラリ
+のみ）で、`curl` の出力を読み解く代わりに次の 3 つを一度に表示します。
+
+1. **経路** … どの ALB のどのリスナールールにマッチし、どこへ流れたか
+2. **レスポンス詳細** … ステータス・全ヘッダ（ALB / Lambda / ECS / 標準に分類）・応答時間・サイズ
+3. **画面表示** … HTML をテキストブラウザ風に整形して枠付きで描画（JSON は整形して色付け）
+
+```powershell
+# ラッパ経由（Python が無ければ自動で docker compose run にフォールバック）
+.\scripts\report.ps1 check intraweb /dashboard
+
+# Python を直接呼んでもよい
+python tools\albcheck.py check intraweb /dashboard
+```
+
+bash 環境の場合:
+
+```bash
+./scripts/report.sh check intraweb /dashboard
+```
+
+出力例（intraweb をメンテナンスにした状態）:
+
+```
+════════════════════════════════════════════════════════════════════════════
+ GET http://localhost:8081/dashboard
+════════════════════════════════════════════════════════════════════════════
+── リクエスト ───────────────────────────────────────────────────────────────
+  GET http://localhost:8081/dashboard
+── レスポンス ───────────────────────────────────────────────────────────────
+  503 Service Unavailable      12.4 ms / 1,724 bytes
+  経路: alb-intraweb  maintenance=true  rule=maintenance-catch-all(prio 100)
+        → tg-intraweb-maintenance(lambda)[builtin]
+── ALB が付与したヘッダ ─────────────────────────────────────────────────────
+  X-Alb-Name            alb-intraweb
+  X-Alb-Matched-Rule    maintenance-catch-all
+  X-Alb-Target          tg-intraweb-maintenance(lambda)
+  X-Alb-Lambda-Variant  builtin
+  X-Alb-Duration-Ms     6.8
+── Lambda / メンテナンス応答のヘッダ ────────────────────────────────────────
+  X-Maintenance               true
+  X-Maintenance-Backend-Kind  web
+── 画面表示 (テキストブラウザ描画)  種別=html ───────────────────────────────
+┌─ ただいまメンテナンス中です ─────────────────────────────────────────────┐
+│ GET http://localhost:8081/dashboard  →  503                              │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│ ただいまメンテナンス中です                                               │
+│ ━━━━━━━━━━━━━━━━━━━━━━━━━━                                               │
+│                                                                          │
+│ システムメンテナンスのため、一時的にサービスを停止しております。         │
+│ メンテナンス時間帯: 2026-08-01 02:00 - 05:00 (JST)                       │
+│                                                                          │
+│ お問い合わせ: システム運用窓口 (内線 1234)                               │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+日本語（全角）を含む行でも枠がずれないよう、East Asian Width を見て表示幅を計算しています。
+
+### 9-1. サブコマンド
+
+| コマンド | 用途 |
+|---|---|
+| `check <service> [path]` | 1 リクエストのレスポンス詳細 + 画面表示 |
+| `report` | 全シナリオを検証して Excel レポートを出力（→ 10 章） |
+| `contract` | 自作 Lambda が ALB 統合の契約を守っているか検証（→ 11 章） |
+| `variant [builtin\|custom]` | invoke 先 Lambda の確認・切り替え（→ 11 章） |
+| `render <url\|file\|service>` | 画面のテキスト描画だけを見る |
+
+### 9-2. よく使うオプション
+
+| オプション | 説明 |
+|---|---|
+| `--width 100` | 表示幅（既定 88 桁）。狭い端末では小さく |
+| `--renderer w3m` | 描画に実物のテキストブラウザを使う（`w3m` / `lynx` / `links`） |
+| `--renderer auto` | インストール済みのテキストブラウザがあれば使い、無ければ内蔵描画 |
+| `-H "Name: value"` | ヘッダを追加（バイパス検証用） |
+| `--xff 10.0.100.5` | `X-Forwarded-For` を指定（`source-ip` 条件の検証用） |
+| `--raw` | 本文の生データも表示 |
+| `--no-color` | ANSI 色を使わない（ログに残すとき） |
+
+```powershell
+# 運用者セグメントからのアクセスを再現（バイパスされて ECS の画面が出る）
+.\scripts\report.ps1 check intraweb /dashboard --xff 10.0.100.5
+
+# 運用ヘッダでのバイパスを確認
+.\scripts\report.ps1 check intraapi /v1/orders -H "X-Maintenance-Bypass: ops-secret-token"
+
+# 実物の w3m で描画（w3m がある環境のみ。無ければ内蔵描画にフォールバック）
+.\scripts\report.ps1 check intraweb /dashboard --renderer w3m
+```
+
+> **ホストに Python が無い場合**
+> `scripts/report.ps1` / `report.sh` は自動で `docker compose run --rm inspector ...` に
+> フォールバックします。この `inspector` コンテナには **w3m / lynx が入っている**ので、
+> `--renderer w3m` での確認もそのまま行えます。
+> 直接呼ぶ場合: `docker compose run --rm inspector check intraweb /dashboard`
+
+---
+
+## 10. Excel レポートを出力する
+
+`report` サブコマンドは、**全シナリオを自動実行 → 結果と画面表示をまとめて Excel に出力**します。
+検証エビデンスとしてそのまま提出できる形式です。**openpyxl などのインストールは不要**で、
+xlsx を標準ライブラリだけで生成します（`tools/xlsxlite.py`）。
+
+```powershell
+# 全シナリオ検証 + Excel 出力（既定の出力先は reports\alb-lambda-report_<日時>.xlsx）
+.\scripts\report.ps1 report
+
+# 出力先を指定
+.\scripts\report.ps1 report --excel reports\2026-08-02_検証.xlsx
+
+# 同梱 Lambda と自作 Lambda を続けて検証し、1 つのブックにまとめる
+.\scripts\report.ps1 report --variant both
+
+# Lambda の契約チェック（→ 11 章）も一緒に実施
+.\scripts\report.ps1 report --contract
+```
+
+実行すると、メンテナンスの ON/OFF を自動で切り替えながら 21 ケース（約 87 チェック）を
+検証し、**最後に必ず全 ALB を通常モードへ戻します**。全 PASS なら終了コード `0`、
+1 件でも失敗すれば `1` を返すので CI に組み込めます。
+
+### 10-1. 出力されるシート
+
+| シート | 内容 |
+|---|---|
+| **サマリ** | 実行条件（日時・Lambda 実装・描画幅）と PASS/FAIL/WARN 集計、グループ別集計、凡例 |
+| **検証結果** | 1 ケース = 1 行。ステータス・適用ルール・優先度・転送先・Lambda 実装・応答時間・サイズ |
+| **チェック明細** | 「何を期待して実際どうだったか」を 1 項目 1 行で記録（期待値／実際値の列つき） |
+| **レスポンスヘッダ** | 全レスポンスヘッダ。`ALB` / `Lambda` / `ECS` / `標準` に分類済み |
+| **レスポンス本文** | 受信した本文の生データ（HTML / JSON そのまま） |
+| **画面表示** | **テキストブラウザ描画をそのまま貼り付け**。等幅フォント指定なので枠線が崩れません |
+| **Lambda契約チェック** | `--contract` 実行時のみ。ALB Lambda 統合の契約適合結果 |
+
+すべてのシートに**ウィンドウ枠固定とオートフィルタ**が設定済みなので、
+「FAIL だけ絞り込む」「intraweb の行だけ見る」といった確認がすぐできます。
+判定セルは PASS=緑 / FAIL=赤 / WARN=黄で色分けされます。
+
+### 10-2. 1 リクエストだけ Excel に出す
+
+`check` にも `--excel` があります。「この 1 件の画面とレスポンスだけ記録したい」ときに使います。
+
+```powershell
+.\scripts\report.ps1 check intraweb /dashboard --excel reports\intraweb画面.xlsx
+```
+
+> **出力先について**
+> 既定の出力先は `reports/` です（`REPORT_DIR` 環境変数で変更可）。
+> `docker compose run --rm inspector report` で実行した場合も、`./reports` に
+> バインドマウントされているのでホスト側に xlsx が残ります。
+
+---
+
+## 11. Lambda を自作のものに差し替えて検証する
+
+同梱の `lambda/app.py` の代わりに、**自分で書いた Lambda 関数を同じ環境で検証**できます。
+ALB の Lambda ターゲットグループには invoke 先を 2 つ登録してあり、**ターゲットグループ ARN
+はそのまま**に invoke 先だけを切り替えます。つまり自作 Lambda にも、実 ALB からの呼び出しと
+**まったく同じイベント**が渡ります。
+
+| variant | コンテナ | ソース | 直接 invoke |
+|---|---|---|---|
+| `builtin`（既定） | `maintenance-lambda` | `lambda/app.py` | http://localhost:9001 |
+| `custom` | `custom-lambda` | **`lambda-custom/app.py`** | http://localhost:9002 |
+
+### 11-1. 手順
+
+```powershell
+# 1) lambda-custom\app.py を自分の実装に書き換える（ひな形と契約の説明が入っています）
+
+# 2) 反映
+docker compose up -d --build custom-lambda
+
+# 3) 契約を満たしているか自動チェック（ALB を経由せず直接 invoke して検証）
+.\scripts\report.ps1 contract --variant custom
+
+# 4) invoke 先を自作 Lambda へ切り替え
+.\scripts\mctl.ps1 lambda custom
+
+# 5) メンテナンスにして画面とレスポンスを確認
+.\scripts\mctl.ps1 on intraweb
+.\scripts\report.ps1 check intraweb /dashboard
+
+# 6) 同梱実装へ戻す
+.\scripts\mctl.ps1 lambda builtin
+.\scripts\mctl.ps1 off all
+```
+
+切り替えは ALB ごとに行えます（`.\scripts\mctl.ps1 lambda custom intraweb`）。
+状態はボリューム `alb-state` に永続化され、`docker compose restart` しても維持されます。
+
+現在どちらが使われているかは、**レスポンスヘッダ `X-Alb-Lambda-Variant`** か次のコマンドで分かります。
+
+```powershell
+.\scripts\mctl.ps1 lambda           # 全 ALB の現在値と選択肢を表示
+.\scripts\mctl.ps1 status           # メンテ状態と併せて表示
+```
+
+### 11-2. 自作 Lambda が守るべき契約
+
+ALB の Lambda ターゲットグループ統合には決まった入出力形式があり、**外れると ALB が 502 を返します**
+（実 ALB と同じ挙動）。`lambda-custom/app.py` の冒頭にも同じ説明を書いてあります。
+
+受け取るイベント:
+
+| キー | 内容 |
+|---|---|
+| `requestContext.elb.targetGroupArn` | 呼び出し元ターゲットグループ ARN（**web/api の判定に使う**） |
+| `httpMethod` / `path` / `queryStringParameters` | リクエストライン |
+| `headers` | 小文字化されたヘッダ（`x-forwarded-for` などを含む） |
+| `body` / `isBase64Encoded` | ボディ |
+
+返す値:
+
+| キー | 型 | 必須 |
+|---|---|---|
+| `statusCode` | int（100–599） | ○ |
+| `statusDescription` | str（例 `"503 Service Unavailable"`） | |
+| `headers` | dict[str, **str**]（値が文字列でないと壊れます） | |
+| `multiValueHeaders` | dict[str, list[str]] | |
+| `body` | str（bytes を返すなら base64 化して `isBase64Encoded: true`） | ○ |
+| `isBase64Encoded` | bool | |
+
+### 11-3. 契約チェックの実行
+
+`contract` サブコマンドが、4 サービス分の ARN でそれぞれ直接 invoke し、上記を検証します。
+
+```powershell
+.\scripts\report.ps1 contract --variant custom            # 自作 Lambda
+.\scripts\report.ps1 contract --variant custom --screen   # 返ってきた画面も描画する
+.\scripts\report.ps1 contract --variant builtin           # 同梱実装（比較用）
+.\scripts\report.ps1 contract --variant custom --excel reports\契約チェック.xlsx
+```
+
+検証項目は 2 段階に分かれます。
+
+- **必須**（外すと ALB が 502 を返す）… `statusCode` が int、`headers` の値がすべて文字列、
+  `body` が str、`isBase64Encoded` が bool、関数エラーが出ないこと
+- **推奨**（動くが直したい）… web 向け ARN なら `text/html` を返す、api 向け ARN なら HTML を
+  返さない、`Retry-After` を付ける
+
+出力例:
+
+```
+  PASS intraweb  (web 向け)
+     ✔ statusCode                 期待=int (100-599)
+     ✔ headers の値                期待=すべて文字列
+     ✔ body                       期待=str
+     ✔ Content-Type (web 向け)     期待=text/html*
+     ✔ 本文 (web 向け)             期待=HTML であること
+```
+
+### 11-4. 全シナリオを両方の実装で検証する
+
+```powershell
+.\scripts\report.ps1 report --variant both --contract
+```
+
+同梱実装と自作実装で同じ 21 ケースを続けて実行し、**1 つの Excel ブックに「実装」列つきで
+まとめて出力**します。「自作 Lambda に差し替えてもリスナールールの挙動が変わらないこと」を
+そのまま比較できます。
+
+---
+
+## 12. リスナールールの仕組みと書き方
 
 ルールは `alb/config/<service>.yaml` に定義します。**優先度（priority）の小さい順**に評価し、
 最初にマッチしたルールのアクションを実行、どれにもマッチしなければ `default_action` です
@@ -462,7 +816,7 @@ docker compose restart alb-intraweb
 
 ---
 
-## 10. Lambda がどうやって Web/API を判定しているか
+## 13. Lambda がどうやって Web/API を判定しているか
 
 実 ALB は Lambda ターゲットグループ経由の呼び出しで、イベントに
 **`requestContext.elb.targetGroupArn`** を必ず含めます。本環境の Lambda はこれを使って
@@ -497,7 +851,7 @@ Lambda の環境変数（`docker-compose.yml` の `maintenance-lambda`）:
 
 ---
 
-## 11. Lambda を単体で叩く（ALB を経由しない）
+## 14. Lambda を単体で叩く（ALB を経由しない）
 
 Lambda 単体のユニットテストとして、RIE のエンドポイントへ ELB イベントを直接 POST できます。
 
@@ -524,6 +878,15 @@ curl -s -XPOST "http://localhost:9001/2015-03-31/functions/function/invocations"
 ```
 
 ARN の `tg-sfapi-maintenance` を `tg-intraweb-maintenance` に変えると HTML が返ることを確認できます。
+ポートを `9002` にすれば自作 Lambda（`lambda-custom/app.py`）を同じ方法で叩けます。
+
+この 4 パターン（web 1 本 + api 3 本）を自動で叩き、戻り値が ALB 統合の契約を満たしているか
+まで検証するのが `contract` サブコマンドです（→ [11-3](#11-3-契約チェックの実行)）。
+
+```powershell
+.\scripts\report.ps1 contract --variant builtin --screen   # 同梱実装
+.\scripts\report.ps1 contract --variant custom  --screen   # 自作実装
+```
 
 PowerShell の場合:
 
@@ -538,7 +901,7 @@ Invoke-RestMethod 'http://localhost:9001/2015-03-31/functions/function/invocatio
 
 ---
 
-## 12. レスポンスヘッダで挙動をデバッグする
+## 15. レスポンスヘッダで挙動をデバッグする
 
 ALB シミュレータは、検証しやすいよう毎回次のヘッダを付与します。
 
@@ -549,6 +912,9 @@ ALB シミュレータは、検証しやすいよう毎回次のヘッダを付�
 | `X-Alb-Rule-Priority` | そのルールの優先度 |
 | `X-Alb-Target` | 転送先（`tg-xxx-ecs(ecs)` / `tg-xxx-maintenance(lambda)` / `fixed-response`） |
 | `X-Alb-Maintenance` | その ALB のメンテナンス状態（`true` / `false`） |
+| `X-Alb-Lambda-Variant` | **どの Lambda 実装が呼ばれたか**（`builtin` / `custom`）。Lambda 経由のときだけ付与 |
+| `X-Alb-Lambda-Endpoint` | 実際に invoke した URL（差し替えの確認用） |
+| `X-Alb-Duration-Ms` | ALB 内での処理時間（ミリ秒） |
 | `X-Amzn-Trace-Id` | ALB が付与するトレース ID（ECS/Lambda にも渡される） |
 
 Lambda 側が付与するヘッダ:
@@ -566,22 +932,30 @@ Lambda 側が付与するヘッダ:
 curl.exe -s -o NUL -D - http://localhost:8081/dashboard
 ```
 
+分類済みのヘッダ一覧と画面表示をまとめて見たいときは albcheck が便利です:
+
+```powershell
+.\scripts\report.ps1 check intraweb /dashboard
+```
+
 ---
 
-## 13. ログの見方
+## 16. ログの見方
 
 ```powershell
 docker compose logs -f                      # 全部
 docker compose logs -f alb-intraweb         # 特定 ALB のアクセスログ
-docker compose logs -f maintenance-lambda   # Lambda の実行ログ（受信イベント全文つき）
+docker compose logs -f maintenance-lambda   # 同梱 Lambda の実行ログ（受信イベント全文つき）
+docker compose logs -f custom-lambda        # 自作 Lambda の実行ログ
 docker compose logs -f intraweb             # ECS 側のログ
 ```
 
-ALB のアクセスログ例（どのルールでどこへ流れたかが 1 行で分かります）:
+ALB のアクセスログ例（どのルールでどの Lambda 実装へ流れたかが 1 行で分かります）:
 
 ```
 ALB=alb-intraweb maint=True client=172.24.0.1 "GET /dashboard"
-  rule=maintenance-catch-all(prio=100) target=tg-intraweb-maintenance(lambda) status=503 6.8ms
+  rule=maintenance-catch-all(prio=100) target=tg-intraweb-maintenance(lambda)
+  variant=builtin status=503 6.8ms
 ```
 
 Lambda のログ例:
@@ -592,12 +966,15 @@ maintenance response: service=intraweb kind=web status=503 method=GET path=/dash
 
 ---
 
-## 14. カスタマイズ方法
+## 17. カスタマイズ方法
 
 | やりたいこと | 変更箇所 |
 |---|---|
+| **Lambda を自作のものに丸ごと差し替える** | `lambda-custom/app.py` を編集 → `docker compose up -d --build custom-lambda` → `.\scripts\mctl.ps1 lambda custom`（→ [11 章](#11-lambda-を自作のものに差し替えて検証する)） |
 | メンテ画面のデザイン・文言を変える | `lambda/app.py` の `html_body()` → `docker compose up -d --build maintenance-lambda` |
 | API のエラー JSON 構造を変える | `lambda/app.py` の `json_body()` → 同上 |
+| 検証シナリオ（ケース）を増やす | `tools/albcheck.py` の `PLAN` にケースを追加 |
+| Excel レポートの列やシートを変える | `tools/report_excel.py` |
 | API のステータスコードを 503 以外にする | `docker-compose.yml` の `MAINT_API_STATUS` または `API_STATUS_OVERRIDES`（例 `{"sfapi":429}`）→ `docker compose up -d maintenance-lambda` |
 | メンテ時間帯・問い合わせ先の文言 | `MAINT_WINDOW` / `CONTACT` 環境変数 |
 | バイパス条件（IP・ヘッダ・パス）を変える | `alb/config/<service>.yaml` の `rules` → `/admin/reload` |
@@ -621,13 +998,15 @@ curl.exe -i http://localhost:8084/v1/orders     # HTTP/1.1 429 になる
 
 ---
 
-## 15. 本番 AWS への持っていき方
+## 18. 本番 AWS への持っていき方
 
 この環境の各要素は、AWS の実リソースと次のように対応します。
 
 | ローカル | AWS |
 |---|---|
 | `lambda/app.py` の `handler` | Lambda 関数（そのまま使えます。ランタイム Python 3.12） |
+| `lambda-custom/app.py` の `handler` | 同上（自作実装。ローカルで契約チェックを通してからデプロイ） |
+| variant の切り替え（`builtin`／`custom`） | ターゲットグループの登録先 Lambda を差し替え（`aws elbv2 register-targets`）／エイリアス切り替え |
 | `alb/config/*.yaml` の `rules` | ALB リスナールール（優先度・条件・アクションが 1:1 対応） |
 | `target_groups[*].type: lambda` | Lambda ターゲットグループ（`TargetType=lambda`） |
 | メンテナンス ON | メンテ用リスナールール（priority 100 等）を **追加**、または優先度を有効化 |
@@ -652,7 +1031,7 @@ AWS 側で必要な追加設定（ローカルでは省略しているもの）:
 
 ---
 
-## 16. トラブルシューティング
+## 19. トラブルシューティング
 
 | 症状 | 原因と対処 |
 |---|---|
@@ -663,11 +1042,16 @@ AWS 側で必要な追加設定（ローカルでは省略しているもの）:
 | `X-Forwarded-For` を付けても source-ip バイパスが効かない | ヘッダ名のスペル、CIDR（既定 `10.0.100.0/24`）を確認。`.\scripts\mctl.ps1 rules intraweb` で条件を確認 |
 | YAML を編集しても反映されない | `POST /admin/reload` するか `docker compose restart alb-xxx` |
 | メンテ状態が意図せず残っている | 状態はボリューム `alb-state` に永続化。`.\scripts\mctl.ps1 off all` か `docker compose down -v` |
-| Lambda のレスポンス形式を壊した | ALB は不正なレスポンスに対し 502 を返します（実 ALB と同じ）。`docker compose logs maintenance-lambda` を確認 |
+| Lambda のレスポンス形式を壊した | ALB は不正なレスポンスに対し 502 を返します（実 ALB と同じ）。`.\scripts\report.ps1 contract --variant custom` でどの項目が契約違反か特定できます |
+| 自作 Lambda に差し替えたのに応答が変わらない | `X-Alb-Lambda-Variant` ヘッダを確認。`builtin` のままなら `.\scripts\mctl.ps1 lambda custom`。コード変更後は `docker compose up -d --build custom-lambda` が必要 |
+| 自作 Lambda に切り替えたら 502 になる | `custom-lambda` コンテナが起動していない、または戻り値の形式が不正。`docker compose logs custom-lambda` と `.\scripts\report.ps1 contract --variant custom` を確認 |
+| `report.ps1` が「Python が無い」と言う | 自動で `docker compose run --rm inspector` にフォールバックします（そのまま使えます）。ホストで実行したい場合は Python 3.8 以上を入れてください |
+| 画面表示の枠がずれる / 文字化けする | 端末のフォントが等幅でないか、コードページが UTF-8 でない。`chcp 65001` を実行するか Windows Terminal を使ってください。`--width` を狭めるのも有効です |
+| Excel の「画面表示」シートで枠がずれる | 該当列のフォントが `MS Gothic` になっているか確認してください（等幅でないと崩れます） |
 
 ---
 
-## 17. 環境の停止・削除
+## 20. 環境の停止・削除
 
 ```powershell
 docker compose stop                 # 停止（状態は保持）
@@ -679,7 +1063,7 @@ docker compose down -v --rmi local  # ビルドしたイメージも削除
 
 ---
 
-## 18. この環境で再現できること／できないこと
+## 21. この環境で再現できること／できないこと
 
 **再現できること**
 
@@ -691,6 +1075,8 @@ docker compose down -v --rmi local  # ビルドしたイメージも削除
 - ALB による `X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Port` / `X-Amzn-Trace-Id` の付与
 - fixed-response / redirect アクション
 - ALB ごとに独立したメンテナンス切り替え
+- **自作 Lambda への差し替え**（ターゲットグループ ARN を保ったまま invoke 先だけを切り替え）
+- **自作 Lambda が ALB 統合の契約を満たしているかの検証**（`contract` サブコマンド）
 
 **再現していないこと（必要なら別途 AWS で確認）**
 

@@ -1,13 +1,27 @@
 #!/usr/bin/env bash
-# メンテナンスモード操作ツール (bash / Git Bash / WSL / macOS / Linux)
+# メンテナンスモード / Lambda 差し替え操作ツール (bash / Git Bash / WSL / macOS / Linux)
 #   ./scripts/mctl.sh status
 #   ./scripts/mctl.sh on  intraweb
 #   ./scripts/mctl.sh off all
 #   ./scripts/mctl.sh rules sfapi
+#   ./scripts/mctl.sh lambda                    # 現在の Lambda 実装 (variant) を表示
+#   ./scripts/mctl.sh lambda custom             # 全 ALB を自作 Lambda へ差し替え
+#   ./scripts/mctl.sh lambda builtin intraweb   # intraweb だけ同梱実装へ戻す
 set -euo pipefail
 
 action="${1:-status}"
-service="${2:-all}"
+arg2="${2:-all}"
+arg3="${3:-all}"
+
+variant=""
+service="$arg2"
+# lambda のときは 2 番目の引数を variant として扱う (サービス名でも all でもない場合)
+if [ "$action" = "lambda" ]; then
+  case "$arg2" in
+    intraweb|interapi|intraapi|sfapi|all) ;;
+    *) variant="$arg2"; service="$arg3" ;;
+  esac
+fi
 
 admin_port() {
   case "$1" in
@@ -30,6 +44,13 @@ for s in $(targets); do
     on)     curl -s -X POST "$base/admin/maintenance/on" ; echo ;;
     off)    curl -s -X POST "$base/admin/maintenance/off" ; echo ;;
     rules)  curl -s "$base/admin/rules" ; echo ;;
-    *) echo "usage: $0 {status|on|off|rules} [intraweb|interapi|intraapi|sfapi|all]" >&2; exit 1 ;;
+    lambda)
+      if [ -n "$variant" ]; then
+        curl -s -X POST "$base/admin/lambda" -H 'Content-Type: application/json' \
+          -d "{\"variant\":\"$variant\",\"note\":\"mctl\"}" ; echo
+      else
+        curl -s "$base/admin/lambda" ; echo
+      fi ;;
+    *) echo "usage: $0 {status|on|off|rules|lambda} [intraweb|interapi|intraapi|sfapi|all]" >&2; exit 1 ;;
   esac
 done

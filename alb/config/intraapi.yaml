@@ -22,7 +22,10 @@ target_groups:
   tg-intraapi-maintenance:
     type: lambda
     target_group_arn: arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:targetgroup/tg-intraapi-maintenance/3333333333333333
+    # variant=builtin (既定) / custom = 自作 Lambda (POST /admin/lambda で切替)
     endpoint: http://maintenance-lambda:8080/2015-03-31/functions/function/invocations
+    variants:
+      custom: http://custom-lambda:8080/2015-03-31/functions/function/invocations
 
 rules:
   - name: healthcheck-passthrough

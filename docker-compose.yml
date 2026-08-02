@@ -6,7 +6,11 @@
 #            --> alb-intraapi (:8083) --> ecs intraapi   / メンテ中: Lambda -> 503 JSON
 #            --> alb-sfapi    (:8084) --> ecs sfapi      / メンテ中: Lambda -> 503 JSON
 #
-#   管理 API: 9081 / 9082 / 9083 / 9084 (メンテナンスモード ON/OFF)
+#   管理 API: 9081 / 9082 / 9083 / 9084 (メンテナンスモード ON/OFF・Lambda 差し替え)
+#
+#   Lambda は 2 系統を同時に起動し、ALB ごとに invoke 先を切り替えられる:
+#     variant=builtin (既定) -> maintenance-lambda (同梱実装 / :9001)
+#     variant=custom         -> custom-lambda      (自作実装   / :9002)
 # =============================================================================
 
 name: alb-lambda-maintenance-lab
@@ -23,8 +27,11 @@ x-alb: &alb-common
     ADMIN_PORT: "9000"
     STATE_DIR: /state
     MAINTENANCE_DEFAULT: "false"
+    # 起動時に使う Lambda 実装 (builtin / custom)
+    LAMBDA_VARIANT_DEFAULT: "builtin"
   depends_on:
     - maintenance-lambda
+    - custom-lambda
   networks:
     - lab
 
@@ -58,6 +65,30 @@ services:
     ports:
       # 直接 invoke して Lambda 単体テストしたい場合に使用
       - "9001:8080"
+    networks:
+      - lab
+
+  # ---------------------------------------------------------------------------
+  # 自作メンテナンス Lambda (差し替え検証用 / lambda-custom/app.py を編集する)
+  #   ALB の invoke 先を variant=custom に切り替えるとこちらが呼ばれる:
+  #     .\scripts\mctl.ps1 lambda custom all
+  #   コードを編集したら: docker compose up -d --build custom-lambda
+  # ---------------------------------------------------------------------------
+  custom-lambda:
+    build:
+      context: ./lambda-custom
+    container_name: custom-lambda
+    restart: unless-stopped
+    environment:
+      WEB_SERVICES: "intraweb"
+      MAINT_STATUS: "503"
+      RETRY_AFTER: "300"
+      MAINT_WINDOW: "2026-08-01 02:00 - 05:00 (JST)"
+      CONTACT: "システム運用窓口 (内線 1234)"
+      MAINT_TITLE: "メンテナンスのお知らせ"
+    ports:
+      # 直接 invoke して自作 Lambda 単体テストしたい場合に使用
+      - "9002:8080"
     networks:
       - lab
 
@@ -103,12 +134,14 @@ services:
       ADMIN_PORT: "9000"
       STATE_DIR: /state
       MAINTENANCE_DEFAULT: "false"
+      LAMBDA_VARIANT_DEFAULT: "builtin"
       ALB_CONFIG: /etc/alb/intraweb.yaml
     ports:
       - "8081:80"
       - "9081:9000"
     depends_on:
       - maintenance-lambda
+      - custom-lambda
       - intraweb
 
   alb-interapi:
@@ -119,12 +152,14 @@ services:
       ADMIN_PORT: "9000"
       STATE_DIR: /state
       MAINTENANCE_DEFAULT: "false"
+      LAMBDA_VARIANT_DEFAULT: "builtin"
       ALB_CONFIG: /etc/alb/interapi.yaml
     ports:
       - "8082:80"
       - "9082:9000"
     depends_on:
       - maintenance-lambda
+      - custom-lambda
       - interapi
 
   alb-intraapi:
@@ -135,12 +170,14 @@ services:
       ADMIN_PORT: "9000"
       STATE_DIR: /state
       MAINTENANCE_DEFAULT: "false"
+      LAMBDA_VARIANT_DEFAULT: "builtin"
       ALB_CONFIG: /etc/alb/intraapi.yaml
     ports:
       - "8083:80"
       - "9083:9000"
     depends_on:
       - maintenance-lambda
+      - custom-lambda
       - intraapi
 
   alb-sfapi:
@@ -151,13 +188,45 @@ services:
       ADMIN_PORT: "9000"
       STATE_DIR: /state
       MAINTENANCE_DEFAULT: "false"
+      LAMBDA_VARIANT_DEFAULT: "builtin"
       ALB_CONFIG: /etc/alb/sfapi.yaml
     ports:
       - "8084:80"
       - "9084:9000"
     depends_on:
       - maintenance-lambda
+      - custom-lambda
       - sfapi
+
+  # ---------------------------------------------------------------------------
+  # 検証ツール (albcheck) — ホストに Python が無くても使える実行環境
+  #   profiles により通常の up では起動せず、run したときだけ立ち上がる。
+  #     docker compose run --rm inspector report
+  #     docker compose run --rm inspector check intraweb /dashboard
+  #   出力した Excel は ./reports に残る。
+  # ---------------------------------------------------------------------------
+  inspector:
+    build:
+      context: ./tools
+    profiles: ["tools"]
+    volumes:
+      - ./tools:/work/tools:ro
+      - ./reports:/work/reports
+    environment:
+      # コンテナ内からはサービス名で ALB に到達する
+      ALB_URL_INTRAWEB: http://alb-intraweb
+      ALB_URL_INTERAPI: http://alb-interapi
+      ALB_URL_INTRAAPI: http://alb-intraapi
+      ALB_URL_SFAPI: http://alb-sfapi
+      ADMIN_URL_INTRAWEB: http://alb-intraweb:9000
+      ADMIN_URL_INTERAPI: http://alb-interapi:9000
+      ADMIN_URL_INTRAAPI: http://alb-intraapi:9000
+      ADMIN_URL_SFAPI: http://alb-sfapi:9000
+      LAMBDA_URL_BUILTIN: http://maintenance-lambda:8080/2015-03-31/functions/function/invocations
+      LAMBDA_URL_CUSTOM: http://custom-lambda:8080/2015-03-31/functions/function/invocations
+      REPORT_DIR: /work/reports
+    networks:
+      - lab
 
 volumes:
   alb-state:

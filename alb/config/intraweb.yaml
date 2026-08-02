@@ -23,7 +23,12 @@ target_groups:
     type: lambda
     # Lambda はこの targetGroupArn を見て「web 向け」と判断する
     target_group_arn: arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:targetgroup/tg-intraweb-maintenance/1111111111111111
+    # variant=builtin (既定) の invoke 先
     endpoint: http://maintenance-lambda:8080/2015-03-31/functions/function/invocations
+    # 差し替え用の invoke 先。POST /admin/lambda {"variant":"custom"} で切り替わる。
+    # ARN は変わらないので、自作 Lambda にも同一のイベントが渡る。
+    variants:
+      custom: http://custom-lambda:8080/2015-03-31/functions/function/invocations
 
 rules:
   # ---- 常時有効なルール ----

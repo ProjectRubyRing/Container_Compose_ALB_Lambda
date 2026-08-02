@@ -10,6 +10,11 @@ alb_port()  { case "$1" in intraweb) echo 8081;; interapi) echo 8082;; intraapi)
 adm_port()  { case "$1" in intraweb) echo 9081;; interapi) echo 9082;; intraapi) echo 9083;; sfapi) echo 9084;; esac; }
 
 maint() { curl -s -X POST "http://localhost:$(adm_port "$1")/admin/maintenance/$2" > /dev/null; }
+# $1=service $2=variant (builtin|custom)
+lambda_variant() {
+  curl -s -X POST "http://localhost:$(adm_port "$1")/admin/lambda" \
+    -H 'Content-Type: application/json' -d "{\"variant\":\"$2\",\"note\":\"verify\"}" > /dev/null
+}
 
 # $1=name $2=condition(0/1) $3=detail
 assert() {
@@ -78,7 +83,29 @@ req "http://localhost:8083/v1/orders"; s2=$STATUS
 [ "$s1" = "200" ] && assert "interapi のみ復旧 -> 200" 1 || assert "interapi のみ復旧 -> 200" 0 "actual=$s1"
 [ "$s2" = "503" ] && assert "intraapi はメンテ継続 -> 503" 1 || assert "intraapi はメンテ継続 -> 503" 0 "actual=$s2"
 
-printf "\n${CYAN}=== 5. 後片付け ===${NC}\n"
+printf "\n${CYAN}=== 5. Lambda 実装の差し替え (builtin <-> custom) ===${NC}\n"
+maint intraweb on; maint sfapi on
+for s in intraweb sfapi; do lambda_variant "$s" builtin; done
+req "http://localhost:8081/dashboard"
+[ "$(hdr_val X-Alb-Lambda-Variant)" = "builtin" ] && assert "intraweb : 既定は builtin" 1 || assert "intraweb : 既定は builtin" 0 "actual=$(hdr_val X-Alb-Lambda-Variant)"
+
+for s in intraweb sfapi; do lambda_variant "$s" custom; done
+req "http://localhost:8081/dashboard"
+[ "$STATUS" = "503" ] && assert "intraweb : 差し替え後も 503" 1 || assert "intraweb : 差し替え後も 503" 0 "actual=$STATUS"
+[ "$(hdr_val X-Alb-Lambda-Variant)" = "custom" ] && assert "intraweb : 自作 Lambda が応答" 1 || assert "intraweb : 自作 Lambda が応答" 0 "actual=$(hdr_val X-Alb-Lambda-Variant)"
+[ "$(hdr_val X-Maintenance-Impl)" = "custom" ] && assert "intraweb : 自作実装の目印ヘッダ" 1 || assert "intraweb : 自作実装の目印ヘッダ" 0 "actual=$(hdr_val X-Maintenance-Impl)"
+case "$(hdr_val Content-Type)" in text/html*) assert "intraweb : web なので HTML" 1;; *) assert "intraweb : web なので HTML" 0 "actual=$(hdr_val Content-Type)";; esac
+
+req "http://localhost:8084/v1/orders"
+[ "$(hdr_val X-Alb-Lambda-Variant)" = "custom" ] && assert "sfapi : 自作 Lambda が応答" 1 || assert "sfapi : 自作 Lambda が応答" 0 "actual=$(hdr_val X-Alb-Lambda-Variant)"
+case "$(hdr_val Content-Type)" in application/json*) assert "sfapi : api なので JSON" 1;; *) assert "sfapi : api なので JSON" 0 "actual=$(hdr_val Content-Type)";; esac
+echo "$BODY" | grep -q '"service": *"sfapi"' && assert "sfapi : 自作 Lambda もサービスを識別" 1 || assert "sfapi : 自作 Lambda もサービスを識別" 0
+
+for s in intraweb sfapi; do lambda_variant "$s" builtin; done
+req "http://localhost:8081/dashboard"
+[ "$(hdr_val X-Alb-Lambda-Variant)" = "builtin" ] && assert "intraweb : builtin に戻る" 1 || assert "intraweb : builtin に戻る" 0 "actual=$(hdr_val X-Alb-Lambda-Variant)"
+
+printf "\n${CYAN}=== 6. 後片付け ===${NC}\n"
 for s in intraweb interapi intraapi sfapi; do maint "$s" off; done
 for s in intraweb interapi intraapi sfapi; do
   req "http://localhost:$(alb_port $s)/"
