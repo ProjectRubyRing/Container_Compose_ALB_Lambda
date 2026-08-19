@@ -14,6 +14,14 @@
 #   --in-container   検証用コンテナの中から実行する (ホストのポートに届かない環境向け)
 #   (無指定)         ホストから届くかを確認し、届かなければコンテナ内実行へ自動で切り替える
 #
+# ALB へ送る Host ヘッダ / メンテ中に期待するステータスコード:
+#   ./scripts/report.sh report --host maint.example.com --status 441
+#   ./scripts/report.sh --alb-host maint.example.com report      # 先頭に置く場合
+#   ※ 先頭の --host は上記のとおり「ホストで実行する」の意味なので、
+#     サブコマンドより前に置くときは --alb-host を使ってください。
+#   環境変数 VERIFY_HOST / HOST_<SERVICE> / MAINT_STATUS_EXPECT でも指定できます
+#   (コンテナ内実行のときも引き継ぎます)。
+#
 # ブラウザは一切不要です。メンテナンス画面は check / render がテキスト描画します。
 set -euo pipefail
 
@@ -21,10 +29,18 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tool="$root/tools/albcheck.py"
 
 mode=auto
+globals=()   # albcheck へ渡すグローバルオプション (サブコマンドより前に置く必要がある)
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --host)                    mode=host;      shift ;;
     --in-container|--container) mode=container; shift ;;
+    # ALB へ送る Host ヘッダ。先頭の --host は「ホストで実行」の意味なので別名にする
+    --alb-host)   [ "$#" -ge 2 ] || { echo "エラー: --alb-host にはホスト名が必要です" >&2; exit 2; }
+                  globals+=(--host "$2"); shift 2 ;;
+    --alb-host=*) globals+=(--host "${1#--alb-host=}"); shift ;;
+    --status)     [ "$#" -ge 2 ] || { echo "エラー: --status にはコードが必要です" >&2; exit 2; }
+                  globals+=(--status "$2"); shift 2 ;;
+    --status=*)   globals+=(--status "${1#--status=}"); shift ;;
     *) break ;;
   esac
 done
@@ -61,7 +77,17 @@ for rt in docker podman nerdctl; do
 done
 
 run_on_host() {
-  exec "$python_bin" "$tool" "$@"
+  exec "$python_bin" "$tool" ${globals[@]+"${globals[@]}"} "$@"
+}
+
+# Host ヘッダ / 期待ステータスの指定はコンテナの中へも引き継ぐ
+# (verify.sh / mctl.sh と同じ環境変数名)
+env_args() {
+  local name
+  for name in VERIFY_HOST HOST_INTRAWEB HOST_INTERAPI HOST_INTRAAPI HOST_SFAPI \
+              MAINT_STATUS_EXPECT; do
+    if [ -n "${!name:-}" ]; then printf '%s\n' "-e" "$name=${!name}"; fi
+  done
 }
 
 # コンテナの中から albcheck を動かす。
@@ -74,10 +100,14 @@ run_in_container() {
     exit 3
   fi
 
+  local envs=()
+  while IFS= read -r line; do envs+=("$line"); done < <(env_args)
+
   if [ -n "$compose" ]; then
     echo "[コンテナ内で実行] $compose run --rm inspector $*" >&2
     cd "$root"
-    exec $compose run --rm inspector "$@"
+    exec $compose run --rm ${envs[@]+"${envs[@]}"} inspector \
+      ${globals[@]+"${globals[@]}"} "$@"
   fi
 
   local network
@@ -113,7 +143,9 @@ run_in_container() {
     -e LAMBDA_URL_BUILTIN=http://maintenance-lambda:8080/2015-03-31/functions/function/invocations \
     -e LAMBDA_URL_CUSTOM=http://custom-lambda:8080/2015-03-31/functions/function/invocations \
     -e REPORT_DIR=/work/reports \
-    python:3.12-slim python /work/tools/albcheck.py "$@"
+    ${envs[@]+"${envs[@]}"} \
+    python:3.12-slim python /work/tools/albcheck.py \
+    ${globals[@]+"${globals[@]}"} "$@"
 }
 
 case "$mode" in

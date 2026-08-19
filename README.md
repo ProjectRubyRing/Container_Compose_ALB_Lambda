@@ -246,7 +246,22 @@ bash:
 ./scripts/mctl.sh off all
 ./scripts/mctl.sh rules sfapi
 ./scripts/mctl.sh lambda custom
+
+# 管理 API へ Host ヘッダを送る / 応答ステータスを検査する
+./scripts/mctl.sh --host maint.example.co.jp on intraweb
+./scripts/mctl.sh --status 200 status all      # 200 以外なら終了コード 1
 ```
+
+`mctl.sh` のオプション（`verify.sh` / `report.sh` と同じ環境変数を見ます）:
+
+| 指定方法 | 環境変数 | 既定 | 説明 |
+|---|---|---|---|
+| `--host <ホスト名>` | `VERIFY_HOST` | （指定なし） | 管理 API へ送る `Host:` ヘッダ |
+| `--host <サービス>=<ホスト名>` | `HOST_<SERVICE>` | （指定なし） | サービス別の `Host:` ヘッダ |
+| `--status <コード>` | `ADMIN_STATUS_EXPECT` | `200` | 期待する HTTP ステータス。違えば終了コード 1 |
+
+応答本文（JSON）は従来どおり標準出力へ、`サービス : HTTP <コード>` は標準エラーへ出すので、
+`./scripts/mctl.sh status | jq` のような使い方はそのまま動きます。
 
 `status` の出力例（`lambda=` が現在の Lambda 実装）:
 
@@ -589,6 +604,22 @@ bash 環境の場合:
 | `--save screen.html` | `check` のレスポンス本文をファイルに保存（後で手元へ持ち帰って開ける） |
 | `--save-text screen.txt` | `check` の画面描画結果をテキストで保存（そのまま報告書に貼れる） |
 | `--no-autodiscover` | 接続先の自動検出をやめ、`localhost` だけを使う |
+| `--host <ホスト名>` | ALB へ送る `Host:` ヘッダ（`VERIFY_HOST` でも可） |
+| `--host <サービス>=<ホスト名>` | サービス別の `Host:` ヘッダ（`HOST_<SERVICE>` でも可） |
+| `--status 441` | メンテ中に期待する HTTP ステータス（既定 441 / `MAINT_STATUS_EXPECT` でも可） |
+
+`--host` / `--status` はサブコマンドの**前後どちらにも**書けます。指定した `Host:` は
+`check` / `report` / `render` / `contract`（Lambda イベントの `headers.host`）に適用され、
+`check` のリクエスト欄にも表示されます。ALB の `fixed-response`（sfapi の `/internal/*`）は
+ALB 設定側の固定値なので `--status` の対象外です（503 のまま）。
+
+```bash
+# 自作 Lambda が Host で分岐する場合
+./scripts/report.sh report --host maint.example.co.jp --status 441
+
+# 同梱の builtin Lambda（503）を検証する
+./scripts/report.sh report --status 503
+```
 
 ラッパ（`report.sh` / `report.ps1`）には、**実行場所**を選ぶオプションもあります。
 サブコマンドより**前**に置いてください。
@@ -598,6 +629,13 @@ bash 環境の場合:
 | （無指定） | ホストから届くか確認し、届かなければコンテナ内実行へ自動で切り替え |
 | `--host` | 必ずホストの Python で実行する |
 | `--in-container` | 必ず検証用コンテナの中から実行する（ホストのポートに届かない環境向け） |
+
+> **注意**: 先頭に置いた `--host`（値なし）は上表のとおり「**ホストの Python で実行**」の
+> 意味です。サブコマンドより前で ALB の Host ヘッダを指定したいときは
+> `./scripts/report.sh --alb-host maint.example.co.jp report` のように `--alb-host` を
+> 使ってください（サブコマンドの後ろなら `--host` で構いません）。
+> `VERIFY_HOST` / `HOST_<SERVICE>` / `MAINT_STATUS_EXPECT` はコンテナ内実行のときも
+> 引き継がれます。
 
 ```powershell
 # 運用者セグメントからのアクセスを再現（バイパスされて ECS の画面が出る）
@@ -655,7 +693,7 @@ EC2（RHEL / Amazon Linux）へ Session Manager で入った CLI だけの環境
 | コンテナの状態 | 10 コンテナの起動状況。**落ちているものはログ末尾も表示** |
 | 接続確認 | ALB 4 本 + 管理 API 4 本 + Lambda 2 本へ実際にリクエストし、失敗理由を日本語で表示 |
 | 診断 | 原因の判定と、そのまま貼れる対処コマンド |
-| export 行 | 他のスクリプト（`mctl.sh` / `verify.sh`）に同じ接続先を使わせるための `export` |
+| export 行 | 他のスクリプト（`mctl.sh` / `verify.sh`）に同じ接続先・`Host` ヘッダ・期待ステータスを使わせるための `export` |
 
 よくある原因と対処:
 
@@ -677,8 +715,8 @@ EC2（RHEL / Amazon Linux）へ Session Manager で入った CLI だけの環境
 4. コンテナ IP … `http://172.x.x.x:80`（Linux + rootful ランタイム）
 
 そのため、ホストから届かない環境でも `--in-container` を付ければそのまま動きます。
-`mctl.sh` / `verify.sh` は環境変数のみを見るので、`doctor` が出力する `export` 行を
-実行してから使ってください。
+`mctl.sh` / `verify.sh` は接続先の自動検出をしないので、`doctor` が出力する `export` 行を
+実行してから使ってください（`Host` ヘッダと期待ステータスも同じ行に出ます）。
 
 ```bash
 eval "$(./scripts/report.sh doctor | grep '^  export ' | sed 's/^  //')"

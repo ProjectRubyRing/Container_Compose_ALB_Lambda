@@ -14,6 +14,11 @@ pip install は不要 (urllib + 自作 xlsx ライタ)。接続先はすべて�
     ADMIN_URL_<SERVICE>   例 ADMIN_URL_INTRAWEB=http://alb-intraweb:9000
     LAMBDA_URL_<VARIANT>  例 LAMBDA_URL_CUSTOM=http://custom-lambda:8080/...
 
+自作 Lambda が Host ヘッダで処理を分岐する場合や、メンテ中に 503 以外を返す場合は:
+    --host maint.example.com        全 ALB へ送る Host ヘッダ (VERIFY_HOST でも可)
+    --host intraweb=web.example.com サービス別の Host ヘッダ (HOST_<SERVICE> でも可)
+    --status 441                    メンテ中に期待するステータス (MAINT_STATUS_EXPECT でも可)
+
 環境変数が無い場合は接続先を自動検出する (ホストの公開ポート → コンテナ名 → コンテナ IP)。
 ブラウザを開けない環境 (Session Manager 経由の EC2 など) を想定しているため、GUI は一切不要。
 自動検出を止めたいときは --no-autodiscover か ALBCHECK_AUTODISCOVER=0。
@@ -58,6 +63,54 @@ TARGET_GROUP_ARNS = {
     "sfapi": "arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:"
              "targetgroup/tg-sfapi-maintenance/4444444444444444",
 }
+
+
+# ---------------------------------------------------------------------------
+# Host ヘッダ / メンテ中に期待するステータスコード
+#
+# 自作 Lambda はイベントの headers.host を見て処理を分けることがあるため、
+# ALB へ送る Host ヘッダを指定できるようにしておく (指定しなければ送らない =
+# 接続先のホスト名がそのまま入る)。verify.sh / mctl.sh と同じ環境変数を見るので、
+# doctor が出力する export 行と併用できる。
+# ---------------------------------------------------------------------------
+DEFAULT_MAINT_STATUS = 441          # 自作 Lambda 向けの既定値 (同梱 builtin は 503)
+MAINT_STATUS = int(os.environ.get("MAINT_STATUS_EXPECT") or DEFAULT_MAINT_STATUS)
+# ALB の fixed-response が返すステータス (Lambda 非経由なので --status の影響を受けない)
+FIXED_RESPONSE_STATUS = 503
+
+_HOSTS = {}          # service -> host (--host <サービス>=<ホスト名>)
+_HOST_ALL = ""       # 全サービス共通 (--host <ホスト名>)
+
+
+def host_for(service):
+    """このサービスへ送る Host ヘッダ (指定が無ければ空文字)。
+    verify.sh / mctl.sh と同じく「サービス別 > 共通」の順で採用する。"""
+    return (_HOSTS.get(service)
+            or os.environ.get("HOST_" + service.upper())
+            or _HOST_ALL
+            or os.environ.get("VERIFY_HOST")
+            or "")
+
+
+def set_host_spec(spec):
+    """--host の値を取り込む。'name' なら全サービス、'service=name' ならそのサービスだけ。"""
+    global _HOST_ALL
+    if "=" in spec:
+        service, name = spec.split("=", 1)
+        if service not in SERVICES:
+            raise ValueError("未知のサービス名です: %s (%s)" % (service, "|".join(SERVICES)))
+        _HOSTS[service] = name.strip()
+    else:
+        _HOST_ALL = spec.strip()
+
+
+def host_headers(service, headers=None):
+    """headers に Host を足したコピーを返す (明示指定済みならそのまま)"""
+    out = dict(headers or {})
+    name = host_for(service)
+    if name and not any(k.lower() == "host" for k in out):
+        out["Host"] = name
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -359,12 +412,13 @@ def _normal_cases():
     ]
 
 
-def _api_maint_cases():
+def _api_maint_cases(status):
     cases = []
     for i, s in enumerate(["interapi", "intraapi", "sfapi"]):
         cases.append(Case(
-            "A-%d" % (i + 1), "%s: メンテ中は Lambda が 503 + JSON" % s, s, "/v1/orders",
-            expects={"status": 503, "content_type": "application/json",
+            "A-%d" % (i + 1), "%s: メンテ中は Lambda が %d + JSON" % (s, status), s,
+            "/v1/orders",
+            expects={"status": status, "content_type": "application/json",
                      "target_contains": "lambda", "body_not_contains": "<html",
                      "headers": {"X-Maintenance": "true", "Retry-After": True},
                      "json": {"error.code": "SERVICE_UNDER_MAINTENANCE", "error.service": s}},
@@ -380,83 +434,87 @@ def _api_maint_cases():
              expects={"status": 200, "rule": "maintenance-bypass-header",
                       "target_contains": "ecs"},
              note="http-header 条件によるバイパス"),
-        Case("A-6", "intraapi: 誤った運用ヘッダは 503", "intraapi", "/v1/orders",
+        Case("A-6", "intraapi: 誤った運用ヘッダは %d" % status, "intraapi", "/v1/orders",
              headers={"X-Maintenance-Bypass": "wrong-token"},
-             expects={"status": 503, "rule": "maintenance-catch-all",
+             expects={"status": status, "rule": "maintenance-catch-all",
                       "target_contains": "lambda"},
              note="値が一致しなければバイパスされない"),
         Case("A-7", "sfapi: /internal/* は ALB の fixed-response (Lambda 非経由)", "sfapi",
              "/internal/sync",
-             expects={"status": 503, "target_contains": "fixed-response"},
-             note="Lambda を使わない比較用ルール"),
+             expects={"status": FIXED_RESPONSE_STATUS,
+                      "target_contains": "fixed-response"},
+             note="Lambda を使わない比較用ルール (ALB 設定の固定値なので --status の対象外)"),
     ]
     return cases
 
 
-PLAN = [
-    {
-        "group": "1. 通常時",
-        "desc": "4 ALB すべてがデフォルトアクションで ECS サービスへフォワードする",
-        "maintenance": {s: False for s in SERVICES},
-        "cases": _normal_cases(),
-    },
-    {
-        "group": "2. メンテ中 (Web)",
-        "desc": "intraweb は Lambda がメンテナンス画面 (HTML) を返す",
-        "maintenance": {"intraweb": True},
-        "cases": [
-            Case("W-1", "intraweb: メンテナンス画面 (HTML) が返る", "intraweb", "/dashboard",
-                 expects={"status": 503, "content_type": "text/html",
-                          "target_contains": "lambda", "rule": "maintenance-catch-all",
-                          "body_contains": "メンテナンス",
-                          "headers": {"Retry-After": True, "X-Maintenance": "true",
-                                      "X-Maintenance-Backend-Kind": "web"}},
-                 note="人が見る画面なので HTML を返す"),
-            Case("W-2", "intraweb: /healthz はメンテ中も ECS へ (priority 1)", "intraweb",
-                 "/healthz",
-                 expects={"status": 200, "rule": "healthcheck-passthrough",
-                          "target_contains": "ecs"},
-                 note="ヘルスチェックが落ちないようにする"),
-            Case("W-3", "intraweb: 運用者セグメントはバイパス (10.0.100.0/24)", "intraweb",
-                 "/dashboard", headers={"X-Forwarded-For": "10.0.100.5"},
-                 expects={"status": 200, "rule": "maintenance-bypass-source-ip",
-                          "target_contains": "ecs"},
-                 note="source-ip 条件による動作確認用バイパス"),
-            Case("W-4", "intraweb: 対象外 IP はメンテ画面", "intraweb", "/dashboard",
-                 headers={"X-Forwarded-For": "192.168.10.5"},
-                 expects={"status": 503, "rule": "maintenance-catch-all",
-                          "target_contains": "lambda"},
-                 note="CIDR 外はバイパスされない"),
-        ],
-    },
-    {
-        "group": "3. メンテ中 (API)",
-        "desc": "API 3 本は Lambda が HTTP ステータスコード + JSON を返す",
-        "maintenance": {"interapi": True, "intraapi": True, "sfapi": True},
-        "cases": _api_maint_cases(),
-    },
-    {
-        "group": "4. ALB ごとの独立性",
-        "desc": "interapi だけ復旧しても他はメンテナンスのまま",
-        "maintenance": {"interapi": False},
-        "cases": [
-            Case("I-1", "interapi: 復旧して 200", "interapi", "/v1/orders",
-                 expects={"status": 200, "target_contains": "ecs"}),
-            Case("I-2", "intraapi: メンテナンス継続で 503", "intraapi", "/v1/orders",
-                 expects={"status": 503, "target_contains": "lambda"}),
-        ],
-    },
-    {
-        "group": "5. 復旧",
-        "desc": "全 ALB を通常モードへ戻す",
-        "maintenance": {s: False for s in SERVICES},
-        "cases": [
-            Case("R-%d" % (i + 1), "%s: 復旧後 200" % s, s, "/",
-                 expects={"status": 200, "target_contains": "ecs"})
-            for i, s in enumerate(SERVICES)
-        ],
-    },
-]
+def build_plan(status=None):
+    """検証シナリオ一覧。status = メンテ中に Lambda が返すはずのステータスコード。"""
+    status = MAINT_STATUS if status is None else status
+    return [
+        {
+            "group": "1. 通常時",
+            "desc": "4 ALB すべてがデフォルトアクションで ECS サービスへフォワードする",
+            "maintenance": {s: False for s in SERVICES},
+            "cases": _normal_cases(),
+        },
+        {
+            "group": "2. メンテ中 (Web)",
+            "desc": "intraweb は Lambda がメンテナンス画面 (HTML) を返す",
+            "maintenance": {"intraweb": True},
+            "cases": [
+                Case("W-1", "intraweb: メンテナンス画面 (HTML) が返る", "intraweb", "/dashboard",
+                     expects={"status": status, "content_type": "text/html",
+                              "target_contains": "lambda", "rule": "maintenance-catch-all",
+                              "body_contains": "メンテナンス",
+                              "headers": {"Retry-After": True, "X-Maintenance": "true",
+                                          "X-Maintenance-Backend-Kind": "web"}},
+                     note="人が見る画面なので HTML を返す"),
+                Case("W-2", "intraweb: /healthz はメンテ中も ECS へ (priority 1)", "intraweb",
+                     "/healthz",
+                     expects={"status": 200, "rule": "healthcheck-passthrough",
+                              "target_contains": "ecs"},
+                     note="ヘルスチェックが落ちないようにする"),
+                Case("W-3", "intraweb: 運用者セグメントはバイパス (10.0.100.0/24)", "intraweb",
+                     "/dashboard", headers={"X-Forwarded-For": "10.0.100.5"},
+                     expects={"status": 200, "rule": "maintenance-bypass-source-ip",
+                              "target_contains": "ecs"},
+                     note="source-ip 条件による動作確認用バイパス"),
+                Case("W-4", "intraweb: 対象外 IP はメンテ画面", "intraweb", "/dashboard",
+                     headers={"X-Forwarded-For": "192.168.10.5"},
+                     expects={"status": status, "rule": "maintenance-catch-all",
+                              "target_contains": "lambda"},
+                     note="CIDR 外はバイパスされない"),
+            ],
+        },
+        {
+            "group": "3. メンテ中 (API)",
+            "desc": "API 3 本は Lambda が HTTP ステータスコード + JSON を返す",
+            "maintenance": {"interapi": True, "intraapi": True, "sfapi": True},
+            "cases": _api_maint_cases(status),
+        },
+        {
+            "group": "4. ALB ごとの独立性",
+            "desc": "interapi だけ復旧しても他はメンテナンスのまま",
+            "maintenance": {"interapi": False},
+            "cases": [
+                Case("I-1", "interapi: 復旧して 200", "interapi", "/v1/orders",
+                     expects={"status": 200, "target_contains": "ecs"}),
+                Case("I-2", "intraapi: メンテナンス継続で %d" % status, "intraapi", "/v1/orders",
+                     expects={"status": status, "target_contains": "lambda"}),
+            ],
+        },
+        {
+            "group": "5. 復旧",
+            "desc": "全 ALB を通常モードへ戻す",
+            "maintenance": {s: False for s in SERVICES},
+            "cases": [
+                Case("R-%d" % (i + 1), "%s: 復旧後 200" % s, s, "/",
+                     expects={"status": 200, "target_contains": "ecs"})
+                for i, s in enumerate(SERVICES)
+            ],
+        },
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +578,8 @@ class Run:
 
 def do_case(case, group, width, renderer, variant=None):
     url = alb_url(case.service) + case.path
+    # 送った Host をレスポンス詳細 / Excel にも残すため、ケース自体に書き戻す
+    case.headers = host_headers(case.service, case.headers)
     resp = http(url, case.method, case.headers)
     checks = evaluate(resp, case.expects, variant)
     # 枠 (frame) の内側に収まる幅で描画しておく
@@ -738,7 +798,7 @@ def check_contract(endpoint, service):
         checks.append(Check(label, expected, actual, ok, level))
 
     resp = http(endpoint, "POST", {"Content-Type": "application/json"},
-                json.dumps(elb_event(service)))
+                json.dumps(elb_event(service, host=host_for(service) or None)))
     if resp.error:
         add("invoke", "RIE に接続できること", "エラー: %s" % resp.error, False)
         return checks, resp, None
@@ -931,7 +991,7 @@ def _run_plan(variant, args):
     else:
         run.variant = _current_variant(SERVICES[0])
 
-    for step in PLAN:
+    for step in build_plan(MAINT_STATUS):
         print()
         print(c("=== %s : %s ===" % (step["group"], step["desc"]), "1;36"))
         for service, enabled in step["maintenance"].items():
@@ -1056,11 +1116,13 @@ def cmd_variant(args):
 
 def cmd_render(args):
     target = args.target
-    if target in SERVICES:
-        target = alb_url(target) + (args.path or "/")
+    headers = dict(h.split(":", 1) for h in args.header) if args.header else {}
+    headers = {k.strip(): v.strip() for k, v in headers.items()}
+    if args.target in SERVICES:
+        target = alb_url(args.target) + (args.path or "/")
+        headers = host_headers(args.target, headers)
     if target.startswith("http://") or target.startswith("https://"):
-        resp = http(target, headers=dict(
-            h.split(":", 1) for h in args.header) if args.header else {})
+        resp = http(target, headers=headers)
         if resp.error:
             print(c("接続エラー: %s" % resp.error, "1;31"))
             print_connection_help(target, resp.error, args.width)
@@ -1258,6 +1320,13 @@ def cmd_doctor(args):
         print("  export %-38s %s"
               % ("ALB_URL_%s=%s" % (service.upper(), alb_url(service)),
                  "ADMIN_URL_%s=%s" % (service.upper(), admin_url(service))))
+    # Host ヘッダ / 期待ステータスも同じ環境変数で 3 スクリプトに共有できる
+    for service in SERVICES:
+        name = host_for(service)
+        if name:
+            print("  export HOST_%s=%s" % (service.upper(), name))
+    print("  export MAINT_STATUS_EXPECT=%d"
+          "                      # メンテ中に期待するステータス" % MAINT_STATUS)
     print()
     return EXIT_OK if not unreachable else EXIT_UNREACHABLE
 
@@ -1283,10 +1352,36 @@ def _write_excel(runs, path):
     print(c("Excel レポートを出力しました: %s" % os.path.abspath(path), "1;32"))
 
 
+def _status_code(value):
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("ステータスコードは数値で指定してください: %s" % value)
+    if not 100 <= code <= 599:
+        raise argparse.ArgumentTypeError("ステータスコードの範囲外です: %s" % value)
+    return code
+
+
+def _common_options():
+    """サブコマンドの前後どちらにも書けるようにするための共通オプション"""
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--host", "--alb-host", dest="host_spec", action="append",
+                        metavar="[サービス=]ホスト名", default=argparse.SUPPRESS,
+                        help="ALB へ送る Host ヘッダ。'intraweb=web.example.com' の形で"
+                             "サービス別にもできる (複数回指定可 / 既定は送らない)")
+    common.add_argument("--status", dest="maint_status", type=_status_code,
+                        metavar="コード", default=argparse.SUPPRESS,
+                        help="メンテ中に期待する HTTP ステータス (既定 %d / "
+                             "MAINT_STATUS_EXPECT でも指定可)" % MAINT_STATUS)
+    return common
+
+
 def main(argv=None):
-    global COLOR, AUTODISCOVER
+    global COLOR, AUTODISCOVER, MAINT_STATUS
+    common = _common_options()
     parser = argparse.ArgumentParser(
-        prog="albcheck", description="ALB × Lambda メンテナンス応答の呼び出し確認ツール")
+        prog="albcheck", description="ALB × Lambda メンテナンス応答の呼び出し確認ツール",
+        parents=[common])
     parser.add_argument("--width", type=int, default=int(os.environ.get("ALBCHECK_WIDTH", "88")),
                         help="表示幅 (既定 88)")
     parser.add_argument("--renderer", default="builtin",
@@ -1297,7 +1392,7 @@ def main(argv=None):
                         help="接続先の自動検出をせず localhost だけを使う")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("check", help="1 リクエストのレスポンス詳細と画面表示")
+    p = sub.add_parser("check", parents=[common], help="1 リクエストのレスポンス詳細と画面表示")
     p.add_argument("service", choices=SERVICES)
     p.add_argument("path", nargs="?", default="/")
     p.add_argument("--method", default="GET")
@@ -1312,7 +1407,7 @@ def main(argv=None):
                    help="画面のテキスト描画結果を保存 (例 screen.txt)")
     p.set_defaults(func=cmd_check)
 
-    p = sub.add_parser("report", help="全シナリオを検証して Excel レポートを出力")
+    p = sub.add_parser("report", parents=[common], help="全シナリオを検証して Excel レポートを出力")
     p.add_argument("--variant", default="current",
                    choices=["current", "builtin", "custom", "both"],
                    help="検証する Lambda 実装 (both = 両方を続けて検証)")
@@ -1322,26 +1417,26 @@ def main(argv=None):
     p.add_argument("-v", "--verbose", action="store_true", help="全ケースの詳細画面も表示")
     p.set_defaults(func=cmd_report)
 
-    p = sub.add_parser("contract", help="Lambda が ALB 統合の契約を守っているか検証")
+    p = sub.add_parser("contract", parents=[common], help="Lambda が ALB 統合の契約を守っているか検証")
     p.add_argument("--variant", default="custom", help="builtin / custom")
     p.add_argument("--endpoint", help="RIE の invoke URL を直接指定")
     p.add_argument("--screen", action="store_true", help="返ってきた本文を画面表示する")
     p.add_argument("--excel", help="結果を Excel に出力")
     p.set_defaults(func=cmd_contract)
 
-    p = sub.add_parser("variant", help="invoke 先 Lambda (builtin/custom) の確認・切り替え")
+    p = sub.add_parser("variant", parents=[common], help="invoke 先 Lambda (builtin/custom) の確認・切り替え")
     p.add_argument("name", nargs="?", help="切り替え先 (省略時は現在値を表示)")
     p.add_argument("--service", default="all", choices=SERVICES + ["all"])
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=cmd_variant)
 
-    p = sub.add_parser("render", help="URL / HTML ファイルをテキストブラウザ描画")
+    p = sub.add_parser("render", parents=[common], help="URL / HTML ファイルをテキストブラウザ描画")
     p.add_argument("target", help="URL, HTML ファイル, またはサービス名")
     p.add_argument("--path", default="/", help="サービス名を指定したときのパス")
     p.add_argument("-H", "--header", action="append")
     p.set_defaults(func=cmd_render)
 
-    p = sub.add_parser("doctor", help="接続できないときの原因切り分け (GUI 不要)")
+    p = sub.add_parser("doctor", parents=[common], help="接続できないときの原因切り分け (GUI 不要)")
     p.add_argument("--quiet", action="store_true",
                    help="1 行だけ表示して終了コードで返す (ラッパ用)")
     p.set_defaults(func=cmd_doctor)
@@ -1350,6 +1445,12 @@ def main(argv=None):
     COLOR = T.enable_ansi() and not args.no_color
     if args.no_autodiscover:
         AUTODISCOVER = False
+    for spec in getattr(args, "host_spec", None) or []:
+        try:
+            set_host_spec(spec)
+        except ValueError as e:
+            parser.error(str(e))
+    MAINT_STATUS = getattr(args, "maint_status", MAINT_STATUS)
     try:
         return args.func(args)
     except KeyboardInterrupt:
