@@ -154,9 +154,13 @@ bash 環境の場合:
 ```bash
 docker compose up -d --build
 docker compose ps
-bash scripts/verify.sh          # PASS=44 / FAIL=0 になれば成功
-./scripts/report.sh report      # 画面表示つき検証 + Excel レポート
+bash scripts/verify.sh --status 503   # 同梱 Lambda(503) で検証。PASS=44 / FAIL=0 になれば成功
+./scripts/report.sh report           # 画面表示つき検証 + Excel レポート
 ```
+
+> `verify.sh` がメンテ中に期待するステータスコードの既定値は **441**（自作 Lambda 向け）です。
+> 同梱の builtin Lambda（503）を検証するときは上記のように `--status 503` を付けてください。
+> 自作 Lambda が Host ヘッダで処理を分けている場合は `--host <ホスト名>` も指定します。
 
 やりたいことから引く早見表:
 
@@ -451,8 +455,39 @@ powershell -ExecutionPolicy Bypass -File .\scripts\verify.ps1
 | 5 | Lambda 差し替え | `builtin` → `custom` へ切り替えると自作 Lambda が応答し（`X-Alb-Lambda-Variant`）、web は HTML・api は JSON のまま。`builtin` に戻せることも確認 |
 | 6 | 復旧 | 全 ALB を OFF にして 200 に戻る |
 
+上表の 503 は同梱 Lambda（builtin）の既定値です。bash 版 `verify.sh` は判定に使う
+ステータスコードを `--status` で変更でき、既定は自作 Lambda 向けの **441** です。
+
 終了コードは全 PASS で `0`、1 件でも失敗すると `1`（CI に組み込めます）。
 アサーション件数は PowerShell 版が 65 件、bash 版が 44 件です。
+
+#### verify.sh のオプション（Host ヘッダ / 期待ステータス）
+
+自作 Lambda が **Host ヘッダを見て処理を分岐する**場合や、メンテ中に 503 以外の
+ステータスコードを返す場合に合わせて、bash 版は次を指定できます。
+
+| 指定方法 | 環境変数 | 既定 | 説明 |
+|---|---|---|---|
+| `--host <ホスト名>` | `VERIFY_HOST` | （指定なし） | 全 ALB へ送る `Host:` ヘッダ |
+| `--host <サービス>=<ホスト名>` | `HOST_<SERVICE>` | （指定なし） | サービス別の `Host:` ヘッダ（共通指定より優先） |
+| `--status <コード>` | `MAINT_STATUS_EXPECT` | `441` | メンテナンス中に期待する HTTP ステータス |
+
+指定しなければ従来どおり接続先のホスト名（`localhost:8081` など）がそのまま送られます。
+指定した値は実行開始時の「検証条件」ブロックに表示されます。
+
+```bash
+# 全 ALB に同じホスト名を送り、441 で判定する（既定）
+./scripts/verify.sh --host maint.example.co.jp
+
+# サービスごとに別のホスト名を送り、503 で判定する
+./scripts/verify.sh \
+  --host intraweb=intraweb.example.co.jp \
+  --host sfapi=sfapi.example.co.jp \
+  --status 503
+```
+
+`Host` ヘッダは ALB シミュレータの `host-header` 条件評価にも使われ、Lambda へは
+イベントの `headers.host` として渡ります（自作 Lambda 側ではこれを参照します）。
 
 ### verify と report の使い分け
 
